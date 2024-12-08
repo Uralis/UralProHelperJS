@@ -59,7 +59,7 @@ uralprojs.onSdkReady(() => {
 uralprojs.setData('name', "Kseniya");
 ```
 
-#### ➖ Получение данных
+#### ➕ Получение данных
 ```javascript
 const value = uralprojs.getData('name');
 console.log(value); // "Kseniya"
