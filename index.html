@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <title>Ural Pro Helper JS</title>
+    <meta http-equiv="content-type" content="text/html; charset=UTF-8">
+    <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
+</head>
+
+<body>
+    <script src="uralpro-helper-0.08-min.js"></script>
+
+    <script>
+        // значения по умолчанию
+        const defaultData = [
+            ['name', 'Pavel'],
+            ['2', 'test'],
+            [3232411, "232445445text"],
+            ["testArray", [34, 454, 54532, 344, [1, 2, 3, 4], 0, true, 0, "text"]],
+        ];
+
+        // Создание экземпляра библиотеки
+        const uralprojs = new UralProHelperJS({
+            enableLogging: true, // Вывод логов в консоль
+            saveIdArray: defaultData // Массив в формате [ключ, значение]
+        });
+
+        // Проверка готовности
+        uralprojs.onSdkReady(() => {
+            uralprojs.uralpro.log("SDK готово! Выполняем запуск игры. TEST");
+            // Установка готовности игры
+            uralprojs.setGameReady();
+
+            //работа с сохранениями
+            uralprojs.uralpro.log("Сохраненное значение в name:", uralprojs.getData('name'));
+
+            uralprojs.uralpro.log("Устанавливаем новое значение в name:", "Kseniya");
+            uralprojs.setData('name', "Kseniya");
+            uralprojs.uralpro.log("Новое сохраненное значение в name:", uralprojs.getData('name'));
+
+            uralprojs.uralpro.log("Восстанавливаем значение в name");
+            uralprojs.defsetData('name', "Kseniya");
+            uralprojs.uralpro.log("Восстановленное значение в name:", uralprojs.getData('name'));
+
+
+            //пауза в игре
+            uralprojs.documentVisibility({
+                onHidden: () => {
+                    uralprojs.uralpro.log("Страница стала скрытой! TEST");
+                },
+                onVisible: () => {
+                    uralprojs.uralpro.log("Страница снова видима! TEST");
+                },
+            });
+
+            //Вывод рекламы
+            uralprojs.ad.showFullscreenAdv({
+                onOpen: () => {
+                    uralprojs.uralpro.log("Реклама открыта. TEST");
+                },
+                onClose: () => {
+                    uralprojs.uralpro.log("Реклама была закрыта. TEST");
+                },
+                onError: (error) => {
+                    uralprojs.uralpro.error("Ошибка рекламы TEST:", error);
+                }
+            });
+        });
+    </script>
+</body>
+
+</html>
