@@ -30,11 +30,6 @@ const defaultData = [
 ];
 
 const uralprojs = new UralProHelperJS({
-    enableLogging: true, // Логи в консоль
-    saveIdArray: defaultData // Данные по умолчанию
-});
-
-const uralprojs = new UralProHelperJS({
     panelFPS: false, // панель с fps
     errorTracking: true, // отслеживание ошибок
     disableLoggingHtml: false, // Запретить вывод логов в консоль (все логи)
