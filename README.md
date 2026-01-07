@@ -40,7 +40,7 @@ const uralprojs = new UralProHelperJS({
     // purchaseFunctionList: purchaseFunList,
     enableCompression: true,
     compressionThreshold: 200,
-    compressKeys: ['pixelArtSaves', 'pixelArtTimeline'],
+    compressKeys: ['testArray'],
     enableCompressionLogging: true, // Логирование сжатия
     // enableSaveManager: true,
     // showSaveManagerButton: true
