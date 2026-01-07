@@ -11,10 +11,10 @@
 
 ### 1. Подключите библиотеку
 
-Добавьте файл `uralpro-helper-0.08-min.js` в ваш HTML:
+Добавьте файл `uralpro-helper-js-0.24.js` в ваш HTML:
 
 ```html
-<script src="uralpro-helper-0.08-min.js"></script>
+<script src="uralpro-helper-js-0.24.js"></script>
 ```
 
 ### 2. Создайте экземпляр библиотеки
@@ -33,6 +33,24 @@ const uralprojs = new UralProHelperJS({
     enableLogging: true, // Логи в консоль
     saveIdArray: defaultData // Данные по умолчанию
 });
+
+const uralprojs = new UralProHelperJS({
+    panelFPS: false, // панель с fps
+    errorTracking: true, // отслеживание ошибок
+    disableLoggingHtml: false, // Запретить вывод логов в консоль (все логи)
+    enableLoggingLib: true, // Разрешить вывод логов в консоль (только)
+    saveIdArray: defaultData, // Массив в формате [ключ, значение]
+    audioMuteDocumentVisibility: false, //возобновлять автоматически звучание звуков после видимости страницы
+    // codeAfterSaving: afterSaveFunction,
+    // purchaseFunctionList: purchaseFunList,
+    enableCompression: true,
+    compressionThreshold: 200,
+    compressKeys: ['pixelArtSaves', 'pixelArtTimeline'],
+    enableCompressionLogging: true, // Логирование сжатия
+    // enableSaveManager: true,
+    // showSaveManagerButton: true
+});
+
 ```
 
 ---
