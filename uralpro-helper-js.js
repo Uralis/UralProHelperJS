@@ -1,4 +1,4 @@
-/*! Ural Pro Helper JS v0.246 */
+/*! Ural Pro Helper JS v0.246 */ 
 (() => {
   var __defProp = Object.defineProperty;
   var __defProps = Object.defineProperties;
