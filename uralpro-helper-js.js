@@ -1,4 +1,4 @@
-/*! Ural Pro Helper JS v0.246 */ 
+/*! Ural Pro Helper JS v0.274 */
 (() => {
   var __defProp = Object.defineProperty;
   var __defProps = Object.defineProperties;
@@ -75,10 +75,49 @@
       showSaveManagerButton: false,
       // Показывать кнопку менеджера сохранений
       // Debug UI (мини-меню для проверки методов)
-      enableDebugMiniMenu: false
+      enableDebugMiniMenu: false,
       // Показывать мини-меню (также можно включить через ?debug=1)
+      /**
+       * Слияние частых вызовов saveDataUrgently() в один фактический сейв (debounce + верхняя граница по времени).
+       * Иначе при «шторме» вызовов (цикл, платежи и т.д.) каждый мог бы дойти до storage/SDK.
+       */
+      saveUrgentCoalesce: true,
+      /** Пауза после последнего вызова saveDataUrgently, мс (0 = слить синхронный всплеск через microtask). */
+      saveUrgentDebounceMs: 160,
+      /** Максимум ожидания с первого вызова в серии, мс — принудительный сейв (чтобы при постоянных вызовах не откладывать бесконечно). 0 = без лимита. */
+      saveUrgentMaxWaitMs: 4e3,
+      /** YouTube Playables: rewardId для requestRewardedAd (уникальный ID типа награды). */
+      youtubeRewardedAdId: "",
+      /**
+       * YouTube Playables: ключ из saveIdArray/getData, значение которого отправляется в sendScore при сохранении.
+       * Пустая строка — автоотправка score отключена.
+       */
+      youtubeScoreKey: "",
+      /**
+       * YouTube Playables: ключи saveIdArray, которые не пишутся/не читаются из ytgame.game.saveData/loadData
+       * (например язык — только ytgame.system.getLanguage()).
+       */
+      youtubeCloudSaveExcludeKeys: [],
+      /** YouTube Playables: не вызывать checkInternetConnection (fetch) перед onSdkReady. */
+      skipInternetCheckOnYoutube: true,
+      /**
+       * Сборка под YouTube Playables: включает рекомендуемые настройки
+       * (skipInternetCheckOnYoutube, exclude GameLanguageSettings из cloud save и т.д.).
+       */
+      playablesBuild: false
     };
-    return __spreadValues(__spreadValues({}, defaultConfig), userConfig);
+    const merged = __spreadValues(__spreadValues({}, defaultConfig), userConfig);
+    if (merged.playablesBuild) {
+      if (merged.skipInternetCheckOnYoutube === void 0) {
+        merged.skipInternetCheckOnYoutube = true;
+      }
+      const exclude = /* @__PURE__ */ new Set([
+        ...Array.isArray(merged.youtubeCloudSaveExcludeKeys) ? merged.youtubeCloudSaveExcludeKeys : [],
+        "GameLanguageSettings"
+      ]);
+      merged.youtubeCloudSaveExcludeKeys = [...exclude];
+    }
+    return merged;
   }
 
   // src/constants.js
@@ -92,8 +131,9 @@
   var PLATFORM_GAMEPIX = "gamepix";
   var PLATFORM_ANDROID = "android";
   var PLATFORM_PLAYDECK = "playdeck";
+  var PLATFORM_YOUTUBE = "youtube";
   var PLATFORM_UNKNOWN = "unknown";
-  var VALID_PLATFORMS_FROM_URL = [PLATFORM_VK, PLATFORM_OK, PLATFORM_POKI, PLATFORM_CRAZYGAMES, PLATFORM_GAMEPIX, PLATFORM_ANDROID, PLATFORM_PLAYDECK];
+  var VALID_PLATFORMS_FROM_URL = [PLATFORM_VK, PLATFORM_OK, PLATFORM_POKI, PLATFORM_CRAZYGAMES, PLATFORM_GAMEPIX, PLATFORM_ANDROID, PLATFORM_PLAYDECK, PLATFORM_YOUTUBE];
 
   // src/modules/utils.js
   var utils = {
@@ -148,6 +188,57 @@
       } catch (e) {
         return false;
       }
+    },
+    /** Укорачивает значение для лога (объекты через JSON). */
+    truncateForLog(value, maxLen = 150) {
+      if (value === null)
+        return "null";
+      if (value === void 0)
+        return "undefined";
+      let s;
+      try {
+        s = typeof value === "object" ? JSON.stringify(value) : String(value);
+      } catch (e) {
+        s = String(value);
+      }
+      return s.length > maxLen ? s.slice(0, maxLen) + "\u2026" : s;
+    },
+    /**
+     * Фрагмент стека для сообщений «вызов из консоли запрещён» — чтобы было видно, откуда пришёл вызов.
+     * @param {number} maxLines
+     */
+    getConsoleBlockDebugInfo(maxLines = 10) {
+      try {
+        const err = new Error();
+        const raw = err.stack || "";
+        const lines = raw.split("\n").map((l) => l.trim()).filter(Boolean);
+        const body = lines[0] === "Error" ? lines.slice(1) : lines;
+        return body.slice(0, maxLines).join("\n") || "(\u0441\u0442\u0435\u043A \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D)";
+      } catch (e) {
+        return "(\u0441\u0442\u0435\u043A \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D)";
+      }
+    },
+    /**
+     * Подробное сообщение при блокировке вызова из консоли / eval / &lt;anonymous&gt;.
+     * @param {string} operation — что именно пытались выполнить (метод API библиотеки)
+     * @param {Record<string, string|number|boolean>} [details] — ключ, параметры и т.д.
+     */
+    formatConsoleBlockedError(operation, details = {}) {
+      const lines = [
+        "\u0412\u044B\u0437\u043E\u0432 \u0438\u0437 \u043A\u043E\u043D\u0441\u043E\u043B\u0438 (eval / \u0430\u043D\u043E\u043D\u0438\u043C\u043D\u044B\u0439 \u043A\u043E\u043D\u0442\u0435\u043A\u0441\u0442) \u0437\u0430\u043F\u0440\u0435\u0449\u0451\u043D.",
+        `\u041E\u043F\u0435\u0440\u0430\u0446\u0438\u044F: ${operation}`
+      ];
+      if (details && typeof details === "object") {
+        for (const [k, v] of Object.entries(details)) {
+          if (v === void 0 || v === null)
+            continue;
+          lines.push(`${k}: ${String(v)}`);
+        }
+      }
+      lines.push("");
+      lines.push("\u0424\u0440\u0430\u0433\u043C\u0435\u043D\u0442 \u0441\u0442\u0435\u043A\u0430 \u0432\u044B\u0437\u043E\u0432\u0430:");
+      lines.push(utils.getConsoleBlockDebugInfo());
+      return lines.join("\n");
     },
     // Вспомогательный метод для обработки стилей
     formatArgs(args) {
@@ -207,19 +298,10 @@
         if (trimmed === "boolean:false")
           return false;
         if (trimmed.startsWith("[") && trimmed.endsWith("]") || trimmed.startsWith("{") && trimmed.endsWith("}")) {
-          const isLikelyJson = !trimmed.includes("=") && // нет знака равенства
-          !trimmed.includes("(") && // нет круглых скобок
-          !trimmed.includes(")") && (trimmed.includes('"') || // есть кавычки для строк
-          trimmed.includes(":") || // есть двоеточия для объектов
-          trimmed.includes(",") || // есть запятые для разделения
-          trimmed === "{}" || // пустой объект
-          trimmed === "[]");
-          if (isLikelyJson) {
-            try {
-              return JSON.parse(value);
-            } catch (e) {
-              return value;
-            }
+          try {
+            return JSON.parse(value);
+          } catch (e) {
+            return value;
           }
         }
         return value;
@@ -552,11 +634,22 @@
       return btoa(binary);
     });
   }
-  function createSheetsModule() {
+  function createSheetsModule(helper) {
+    const warnPlayablesExternalFetch = () => {
+      if (!helper || helper.platform !== PLATFORM_YOUTUBE)
+        return;
+      if (helper.uralpro.get("_youtubeSheetsFetchWarned"))
+        return;
+      helper.uralpro.set("_youtubeSheetsFetchWarned", true);
+      helper.uralpro.warn(
+        "YouTube Playables: sheetsGoogleApi \u0432\u044B\u043F\u043E\u043B\u043D\u044F\u0435\u0442 \u0432\u043D\u0435\u0448\u043D\u0438\u0439 fetch (Google). \u041D\u0435 \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u0439\u0442\u0435 \u0432 production-\u0441\u0431\u043E\u0440\u043A\u0435 Playables."
+      );
+    };
     return {
       /** GET-запрос с query-параметрами и cache-bust. */
       sendViaGet(scriptUrl, data) {
         return __async(this, null, function* () {
+          warnPlayablesExternalFetch();
           const params = __spreadProps(__spreadValues({}, data), {
             _cacheBust: (/* @__PURE__ */ new Date()).getTime()
           });
@@ -1198,6 +1291,11 @@
 
   // src/modules/audio.js
   function createAudioModule(helper) {
+    const isYoutubeSystemAudioBlocked = () => {
+      if (helper.platform !== PLATFORM_YOUTUBE)
+        return false;
+      return helper.uralpro.get("_youtubeSystemAudioEnabled") === false;
+    };
     const audio = {
       config: {
         sound: true,
@@ -1333,6 +1431,8 @@
         }
       },
       play(name, startTime = true) {
+        if (isYoutubeSystemAudioBlocked())
+          return;
         if (audio.config.nameBackgroundAudio === name) {
           if (!audio.config.backgroundAudio)
             return;
@@ -1530,6 +1630,13 @@
         helper.uralpro.log("\u0413\u0440\u043E\u043C\u043A\u043E\u0441\u0442\u044C \u0432\u0441\u0435\u0445 \u0442\u0440\u0435\u043A\u043E\u0432 \u0432\u043E\u0441\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D\u0430.", `style: color: grey; font-weight: bold; background-color: #f0f0f0; padding: 5px 10px; border-radius: 5px; border: 1px solid #ccc; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1); `);
       },
       update() {
+        if (isYoutubeSystemAudioBlocked()) {
+          audio.tracks.forEach((track, name) => {
+            if (helper.audio)
+              helper.audio.stop(name);
+          });
+          return;
+        }
         audio.tracks.forEach((track, name) => {
           if (audio.config.nameBackgroundAudio === name) {
             helper.uralpro.log(`\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 \u0434\u043B\u044F \u0444\u043E\u043D\u043E\u0432\u043E\u0439 \u043C\u0443\u0437\u044B\u043A\u0438: ${name}, backgroundAudio: ${audio.config.backgroundAudio}`, `style: color: grey; font-weight: bold; background-color: #f0f0f0; padding: 5px 10px; border-radius: 5px; border: 1px solid #ccc; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1); `);
@@ -2572,8 +2679,41 @@ ${this._safeStringify(e)}`;
     updateFPS();
   }
   function runErrorTracking(helper) {
+    var _a, _b;
     let errorShown = false;
+    const showOverlayInProd = ((_b = (_a = helper == null ? void 0 : helper.uralpro) == null ? void 0 : _a.config) == null ? void 0 : _b.showErrorOverlay) === true;
+    const debugFromUrl = (() => {
+      try {
+        return new URLSearchParams(window.location.search).get("debug") === "1";
+      } catch (e) {
+        return false;
+      }
+    })();
+    const shouldShowOverlay = showOverlayInProd || debugFromUrl;
+    function shouldIgnoreError(event, isPromiseRejection) {
+      let message = "";
+      if (isPromiseRejection) {
+        const reason = event == null ? void 0 : event.reason;
+        if (typeof reason === "string")
+          message = reason;
+        else if (reason && typeof reason.message === "string")
+          message = reason.message;
+      } else {
+        message = (event == null ? void 0 : event.message) || "";
+      }
+      const msg = String(message).trim();
+      const msgLower = msg.toLowerCase();
+      const isScriptError = /^script error\.?$/i.test(msg) || /script error/i.test(msg);
+      const isNoisePromise = msgLower.includes("networkerror") || msgLower.includes("failed to fetch") || msgLower.includes("load failed") || msgLower.includes("the user aborted a request");
+      const filename = event == null ? void 0 : event.filename;
+      const lineno = event == null ? void 0 : event.lineno;
+      const colno = event == null ? void 0 : event.colno;
+      const hasNoDetails = !(event == null ? void 0 : event.error) && (!filename || filename === "null" || filename === "undefined") && (!lineno || lineno === "null" || lineno === "undefined") && (!colno || colno === "null" || colno === "undefined");
+      return isScriptError && hasNoDetails || isNoisePromise;
+    }
     function handleError(event, isPromiseRejection = false) {
+      if (shouldIgnoreError(event, isPromiseRejection))
+        return;
       if (errorShown)
         return;
       errorShown = true;
@@ -2598,8 +2738,10 @@ ${event.error.stack.split("\n").join("\n")}`;
 \u{1F310} User Agent: ${navigator.userAgent}`;
         errorMessage += `
 \u{1F4E1} Location: ${window.location.href}`;
-        errorMessage += `
-\u{1F4CB} Cookies: ${document.cookie}`;
+      }
+      if (!shouldShowOverlay) {
+        helper.uralpro.warn("Error tracking captured (overlay disabled in prod):", errorMessage);
+        return;
       }
       let errorBox = document.getElementById("error-box");
       if (!errorBox) {
@@ -2916,6 +3058,355 @@ ${event.error.stack.split("\n").join("\n")}`;
     return api;
   }
 
+  // src/modules/platforms/file/index.js
+  function createAdapter(helper) {
+    const storage = typeof localStorage !== "undefined" ? localStorage : { getItem: () => null, setItem: () => {
+    } };
+    return {
+      getSdk: () => null,
+      getCooldownStorage: () => storage,
+      showFullscreenAd() {
+        return __async(this, null, function* () {
+        });
+      },
+      showRewardedAd() {
+        return __async(this, null, function* () {
+        });
+      },
+      showBanner() {
+      },
+      getLang: () => helper.uralpro.get("lang") || "en",
+      pause: () => {
+        var _a2, _b, _c;
+        if ((_a2 = helper.uralpro.config) == null ? void 0 : _a2.audioMuteDocumentVisibility)
+          try {
+            (_c = (_b = helper.audio) == null ? void 0 : _b.muteAll) == null ? void 0 : _c.call(_b);
+          } catch (e) {
+          }
+      },
+      resume: () => {
+        var _a2, _b, _c;
+        if ((_a2 = helper.uralpro.config) == null ? void 0 : _a2.audioMuteDocumentVisibility)
+          try {
+            (_c = (_b = helper.audio) == null ? void 0 : _b.unmuteAll) == null ? void 0 : _c.call(_b);
+          } catch (e) {
+          }
+      },
+      isReady: () => true
+    };
+  }
+  function setup(helper, context) {
+    const urlLang = new URLSearchParams(window.location.search).get("lang");
+    const defaultLang = window.navigator.language.slice(0, 2);
+    helper.uralpro.set("lang", urlLang || defaultLang);
+    context.loadStartData();
+    helper.uralpro.set("isLoaded", true);
+    helper.uralpro.set("isSdkReady", true);
+    helper.uralpro.set("isSdkReadyData", true);
+    helper.uralpro.set("setup_saveData", 1);
+    helper.saveData();
+    setInterval(helper.saveData, 1e3 * 60);
+  }
+
+  // src/modules/platforms/youtube/index.js
+  var DEFAULT_REWARD_ID = "uralpro_reward_default";
+  var YOUTUBE_SAVE_FORMAT_VERSION = 1;
+  function getSafeStorage() {
+    if (typeof localStorage !== "undefined")
+      return localStorage;
+    return { getItem: () => null, setItem: () => {
+    } };
+  }
+  function getYoutubeCloudSaveExcludeKeys(helper) {
+    var _a;
+    const config = ((_a = helper.uralpro) == null ? void 0 : _a.config) || {};
+    const keys = Array.isArray(config.youtubeCloudSaveExcludeKeys) ? config.youtubeCloudSaveExcludeKeys : [];
+    return new Set(keys.map((k) => String(k)));
+  }
+  function isExcludedYoutubeCloudSaveKey(helper, idname) {
+    if (!idname || typeof idname !== "string")
+      return false;
+    const prefix = helper.uralpro.save_id000 || "";
+    const exclude = getYoutubeCloudSaveExcludeKeys(helper);
+    for (const key of exclude) {
+      if (!key)
+        continue;
+      if (idname === prefix + key || idname.endsWith(key))
+        return true;
+    }
+    return false;
+  }
+  function filterCloudSavePayload(helper, payload) {
+    if (!Array.isArray(payload))
+      return [];
+    return payload.filter(([idname]) => !isExcludedYoutubeCloudSaveKey(helper, idname));
+  }
+  function parseCloudSaveEntries(rawValue) {
+    if (!rawValue || typeof rawValue !== "string" || rawValue.trim() === "")
+      return [];
+    try {
+      const parsed = JSON.parse(rawValue);
+      if (Array.isArray(parsed)) {
+        return parsed.filter((e) => Array.isArray(e) && e.length >= 2 && typeof e[0] === "string");
+      }
+      if (parsed && typeof parsed === "object") {
+        if (parsed.v === YOUTUBE_SAVE_FORMAT_VERSION && Array.isArray(parsed.data)) {
+          return parsed.data.filter((e) => Array.isArray(e) && e.length >= 2 && typeof e[0] === "string");
+        }
+        if (Array.isArray(parsed.data)) {
+          return parsed.data.filter((e) => Array.isArray(e) && e.length >= 2 && typeof e[0] === "string");
+        }
+        return Object.entries(parsed).filter(([k]) => k !== "v" && k !== "data");
+      }
+      return [];
+    } catch (e) {
+      return [];
+    }
+  }
+  function applyLoadedPayloadToMap(helper, rawValue) {
+    var _a, _b, _c;
+    const mapApp = helper.uralpro.get("mapDataApp");
+    if (!mapApp)
+      return 0;
+    const entries = parseCloudSaveEntries(rawValue);
+    let restored = 0;
+    for (const [idname, dataStr] of entries) {
+      if (isExcludedYoutubeCloudSaveKey(helper, idname))
+        continue;
+      const normalized = dataStr !== void 0 && dataStr !== null && typeof dataStr === "object" ? JSON.stringify(dataStr) : String(dataStr != null ? dataStr : "");
+      mapApp.set(idname, normalized);
+      restored++;
+    }
+    if (entries.length === 0 && rawValue && typeof rawValue === "string" && rawValue.trim() !== "") {
+      helper.uralpro.error("YouTube Playables: \u043E\u0448\u0438\u0431\u043A\u0430 \u0440\u0430\u0437\u0431\u043E\u0440\u0430 cloud save");
+      try {
+        (_c = (_b = (_a = helper.uralpro.get("sdk")) == null ? void 0 : _a.health) == null ? void 0 : _b.logError) == null ? void 0 : _c.call(_b);
+      } catch (e) {
+      }
+    }
+    return restored;
+  }
+  function serializeCloudSavePayload(entries) {
+    return JSON.stringify({
+      v: YOUTUBE_SAVE_FORMAT_VERSION,
+      data: Array.isArray(entries) ? entries : []
+    });
+  }
+  function createAdapter2(helper) {
+    const storage = getSafeStorage();
+    return {
+      getSdk: () => helper.uralpro.get("sdk"),
+      getCooldownStorage: () => storage,
+      showFullscreenAd(_0) {
+        return __async(this, arguments, function* ({ onOpen, onClose, onError }) {
+          var _a2, _b, _c;
+          const sdk = helper.uralpro.get("sdk");
+          if (!helper.uralpro.get("isSdkReady") || !((_a2 = sdk == null ? void 0 : sdk.ads) == null ? void 0 : _a2.requestInterstitialAd)) {
+            onError == null ? void 0 : onError();
+            return;
+          }
+          onOpen == null ? void 0 : onOpen();
+          try {
+            yield sdk.ads.requestInterstitialAd();
+            onClose == null ? void 0 : onClose();
+          } catch (e) {
+            helper.uralpro.warn("YouTube Playables: interstitial ad error:", e);
+            try {
+              (_c = (_b = sdk == null ? void 0 : sdk.health) == null ? void 0 : _b.logWarning) == null ? void 0 : _c.call(_b);
+            } catch (e2) {
+            }
+            onError == null ? void 0 : onError(e);
+          }
+        });
+      },
+      showRewardedAd(_0) {
+        return __async(this, arguments, function* ({ onOpen, onRewarded, onClose, onError }) {
+          var _a2, _b, _c, _d;
+          const sdk = helper.uralpro.get("sdk");
+          if (!helper.uralpro.get("isSdkReady") || !((_a2 = sdk == null ? void 0 : sdk.ads) == null ? void 0 : _a2.requestRewardedAd)) {
+            onError == null ? void 0 : onError();
+            return;
+          }
+          onOpen == null ? void 0 : onOpen();
+          try {
+            const rewardId = String(((_b = helper.uralpro.config) == null ? void 0 : _b.youtubeRewardedAdId) || DEFAULT_REWARD_ID);
+            const isRewardEarned = yield sdk.ads.requestRewardedAd(rewardId);
+            if (isRewardEarned)
+              onRewarded == null ? void 0 : onRewarded();
+            onClose == null ? void 0 : onClose();
+          } catch (e) {
+            helper.uralpro.warn("YouTube Playables: rewarded ad error:", e);
+            try {
+              (_d = (_c = sdk == null ? void 0 : sdk.health) == null ? void 0 : _c.logWarning) == null ? void 0 : _d.call(_c);
+            } catch (e2) {
+            }
+            onError == null ? void 0 : onError(e);
+          }
+        });
+      },
+      showBanner: () => {
+      },
+      getLang: () => helper.uralpro.get("lang") || "en",
+      pause: () => {
+      },
+      resume: () => {
+      },
+      isReady: () => !!helper.uralpro.get("isSdkReady"),
+      saveData(payload) {
+        return __async(this, null, function* () {
+          var _a2, _b, _c;
+          const sdk = helper.uralpro.get("sdk");
+          if (!helper.uralpro.get("_youtubeCloudLoadDone") || !((_a2 = sdk == null ? void 0 : sdk.game) == null ? void 0 : _a2.saveData))
+            return false;
+          const filtered = filterCloudSavePayload(helper, payload);
+          const dataToSave = serializeCloudSavePayload(filtered);
+          try {
+            yield sdk.game.saveData(dataToSave);
+            return true;
+          } catch (e) {
+            helper.uralpro.error("YouTube Playables: saveData failed:", e);
+            try {
+              (_c = (_b = sdk == null ? void 0 : sdk.health) == null ? void 0 : _b.logError) == null ? void 0 : _c.call(_b);
+            } catch (e2) {
+            }
+            return false;
+          }
+        });
+      },
+      sendScore(scoreValue) {
+        var _a2;
+        const sdk = helper.uralpro.get("sdk");
+        if (!((_a2 = sdk == null ? void 0 : sdk.engagement) == null ? void 0 : _a2.sendScore))
+          return;
+        const value = Number(scoreValue);
+        if (!Number.isFinite(value))
+          return;
+        try {
+          sdk.engagement.sendScore({ value });
+        } catch (e) {
+          helper.uralpro.warn("YouTube Playables: sendScore error:", e);
+        }
+      }
+    };
+  }
+  function bindYouTubeSystemCallbacks(helper, yt) {
+    var _a, _b, _c, _d;
+    try {
+      (_b = (_a = yt.system) == null ? void 0 : _a.onPause) == null ? void 0 : _b.call(_a, () => {
+        var _a2, _b2;
+        try {
+          (_a2 = helper.saveDataUrgently) == null ? void 0 : _a2.call(helper);
+        } catch (e) {
+        }
+        (_b2 = helper._youtubeDoPause) == null ? void 0 : _b2.call(helper);
+      });
+      (_d = (_c = yt.system) == null ? void 0 : _c.onResume) == null ? void 0 : _d.call(_c, () => {
+        var _a2;
+        (_a2 = helper._youtubeDoResume) == null ? void 0 : _a2.call(helper);
+      });
+    } catch (e) {
+      helper.uralpro.warn("YouTube Playables: onPause/onResume registration failed:", e);
+    }
+  }
+  function scheduleDefaultFirstFrameReady(helper) {
+    if (helper.uralpro.get("youtube_first_frame_ready_called"))
+      return;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        var _a;
+        (_a = helper.notifyFirstFrameReady) == null ? void 0 : _a.call(helper);
+      });
+    });
+  }
+  function tryEarlyFirstFrameReady(helper) {
+    var _a;
+    if (helper.uralpro.get("youtube_first_frame_ready_called"))
+      return;
+    if (typeof document !== "undefined" && document.getElementById("UralProLoading")) {
+      (_a = helper.notifyFirstFrameReady) == null ? void 0 : _a.call(helper);
+      return;
+    }
+    scheduleDefaultFirstFrameReady(helper);
+  }
+  function setup2(helper, context) {
+    return __async(this, null, function* () {
+      var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q;
+      try {
+        const yt = window.ytgame;
+        if (!yt || !yt.IN_PLAYABLES_ENV) {
+          helper.uralpro.warn(
+            'YouTube Playables SDK \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D. \u041F\u043E\u0434\u043A\u043B\u044E\u0447\u0438\u0442\u0435 <script src="https://www.youtube.com/game_api/v1"><\/script> \u0434\u043E \u043A\u043E\u0434\u0430 \u0438\u0433\u0440\u044B.'
+          );
+          setup(helper, context);
+          return;
+        }
+        helper.uralpro.set("sdk", yt);
+        helper.uralpro.set("isLoaded", true);
+        helper.uralpro.set("isSdkReady", true);
+        helper.uralpro.set("youtube_playables_env", true);
+        helper.uralpro.set("_youtubeCloudLoadDone", false);
+        bindYouTubeSystemCallbacks(helper, yt);
+        try {
+          const language = yield (_b = (_a = yt.system) == null ? void 0 : _a.getLanguage) == null ? void 0 : _b.call(_a);
+          if (language && typeof language === "string") {
+            helper.uralpro.set("lang", language.slice(0, 2).toLowerCase());
+          }
+        } catch (e) {
+        }
+        if (!helper.uralpro.get("lang")) {
+          helper.uralpro.set("lang", "en");
+        }
+        try {
+          const isAudioEnabled = yield (_d = (_c = yt.system) == null ? void 0 : _c.isAudioEnabled) == null ? void 0 : _d.call(_c);
+          helper.uralpro.set("_youtubeSystemAudioEnabled", isAudioEnabled !== false);
+          if (isAudioEnabled === false)
+            (_f = (_e = helper.audio) == null ? void 0 : _e.muteAll) == null ? void 0 : _f.call(_e);
+          else
+            (_h = (_g = helper.audio) == null ? void 0 : _g.unmuteAll) == null ? void 0 : _h.call(_g);
+        } catch (e) {
+        }
+        try {
+          (_j = (_i = yt.system) == null ? void 0 : _i.onAudioEnabledChange) == null ? void 0 : _j.call(_i, (isAudioEnabled) => {
+            var _a2, _b2, _c2, _d2;
+            helper.uralpro.set("_youtubeSystemAudioEnabled", !!isAudioEnabled);
+            if (isAudioEnabled)
+              (_b2 = (_a2 = helper.audio) == null ? void 0 : _a2.unmuteAll) == null ? void 0 : _b2.call(_a2);
+            else
+              (_d2 = (_c2 = helper.audio) == null ? void 0 : _c2.muteAll) == null ? void 0 : _d2.call(_c2);
+          });
+        } catch (e) {
+        }
+        let cloudRestored = 0;
+        try {
+          const raw = yield (_l = (_k = yt.game) == null ? void 0 : _k.loadData) == null ? void 0 : _l.call(_k);
+          cloudRestored = applyLoadedPayloadToMap(helper, raw);
+        } catch (e) {
+          helper.uralpro.warn("YouTube Playables: loadData failed, starting with defaults.", e);
+          try {
+            (_n = (_m = yt.health) == null ? void 0 : _m.logWarning) == null ? void 0 : _n.call(_m);
+          } catch (e2) {
+          }
+        }
+        helper.uralpro.set("_youtubeCloudLoadDone", true);
+        helper.uralpro.set("youtube_cloud_restored_keys", cloudRestored);
+        context.loadStartData();
+        helper.uralpro.set("isSdkReadyData", true);
+        helper.uralpro.set("setup_saveData", 1);
+        helper.saveData();
+        setInterval(helper.saveData, 1e3 * 60);
+        tryEarlyFirstFrameReady(helper);
+        helper.uralpro.log("YouTube Playables SDK \u043D\u0430\u0441\u0442\u0440\u043E\u0435\u043D.");
+      } catch (error) {
+        helper.uralpro.error("\u041E\u0448\u0438\u0431\u043A\u0430 \u0438\u043D\u0438\u0446\u0438\u0430\u043B\u0438\u0437\u0430\u0446\u0438\u0438 YouTube Playables SDK:", error);
+        try {
+          (_q = (_p = (_o = helper.uralpro.get("sdk")) == null ? void 0 : _o.health) == null ? void 0 : _p.logError) == null ? void 0 : _q.call(_p);
+        } catch (e) {
+        }
+        setup(helper, context);
+      }
+    });
+  }
+
   // src/modules/storage.js
   function createStorageApi(helper) {
     const mapDataApp = () => helper.uralpro.get("mapDataApp");
@@ -2923,7 +3414,10 @@ ${event.error.stack.split("\n").join("\n")}`;
     const api = {
       setData(key, value) {
         if (utils.isCalledFromConsole()) {
-          helper.uralpro.error("\u0418\u0437\u043C\u0435\u043D\u0435\u043D\u0438\u0435 mapDataSDK \u0438\u0437 \u043A\u043E\u043D\u0441\u043E\u043B\u0438 \u0437\u0430\u043F\u0440\u0435\u0449\u0435\u043D\u043E.");
+          helper.uralpro.error(utils.formatConsoleBlockedError("setData (\u0437\u0430\u043F\u0438\u0441\u044C \u0432 mapDataApp / \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u0438\u044F \u0438\u0433\u0440\u044B)", {
+            \u043A\u043B\u044E\u0447: String(key),
+            "\u0437\u043D\u0430\u0447\u0435\u043D\u0438\u0435 (\u0444\u0440\u0430\u0433\u043C\u0435\u043D\u0442)": utils.truncateForLog(value, 150)
+          }));
           return;
         }
         if (value === null || value === void 0) {
@@ -2950,7 +3444,7 @@ ${event.error.stack.split("\n").join("\n")}`;
           helper.autoAddToSaveIdArray(key, value);
           return utils.safeJsonParse(value);
         }
-        if (helper.platform !== PLATFORM_PLAYDECK) {
+        if (helper.platform !== PLATFORM_PLAYDECK && helper.platform !== PLATFORM_YOUTUBE) {
           const localStorageKey = prefix() + key;
           const localStorageValue = localStorage.getItem(localStorageKey);
           if (localStorageValue !== null && !helper.isSystemSetting(key)) {
@@ -2969,13 +3463,15 @@ ${event.error.stack.split("\n").join("\n")}`;
       },
       getRawData(key) {
         if (utils.isCalledFromConsole()) {
-          helper.uralpro.error("\u041F\u043E\u043B\u0443\u0447\u0435\u043D\u0438\u0435 \u0434\u0430\u043D\u043D\u044B\u0445 \u0438\u0437 \u043A\u043E\u043D\u0441\u043E\u043B\u0438 \u0437\u0430\u043F\u0440\u0435\u0449\u0435\u043D\u043E.");
+          helper.uralpro.error(utils.formatConsoleBlockedError("getRawData (\u0447\u0442\u0435\u043D\u0438\u0435 \u0441\u044B\u0440\u043E\u0433\u043E \u0437\u043D\u0430\u0447\u0435\u043D\u0438\u044F \u0438\u0437 \u0445\u0440\u0430\u043D\u0438\u043B\u0438\u0449\u0430)", {
+            \u043A\u043B\u044E\u0447: String(key)
+          }));
           return null;
         }
         const value = mapDataApp().get(prefix() + key);
         if (value !== void 0 && value !== null)
           return value;
-        if (helper.platform !== PLATFORM_PLAYDECK && helper.platform !== PLATFORM_CRAZYGAMES && helper.platform !== PLATFORM_GAMEPIX) {
+        if (helper.platform !== PLATFORM_PLAYDECK && helper.platform !== PLATFORM_CRAZYGAMES && helper.platform !== PLATFORM_GAMEPIX && helper.platform !== PLATFORM_YOUTUBE) {
           const localStorageKey = prefix() + key;
           const localStorageValue = localStorage.getItem(localStorageKey);
           if (localStorageValue !== null && !helper.isSystemSetting(key))
@@ -2984,14 +3480,18 @@ ${event.error.stack.split("\n").join("\n")}`;
         return value;
       },
       saveDataUrgently() {
-        return __async(this, null, function* () {
-          var _a2, _b, _c, _d, _e, _f, _g, _h, _i;
+        return __async(this, arguments, function* (options = {}) {
+          var _a2, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l;
           if (helper.uralpro.get("setup_saveData") != 1)
             return;
           if (helper.platform === PLATFORM_PLAYDECK && !helper.uralpro.get("_playdeckCloudReady"))
             return;
+          if (helper.platform === PLATFORM_YOUTUBE && !helper.uralpro.get("_youtubeCloudLoadDone"))
+            return;
           if (helper.uralpro.get("_saveInProgress")) {
             helper.uralpro.set("_savePending", true);
+            if ((options == null ? void 0 : options.flush) === true)
+              helper.uralpro.set("_savePendingFlush", true);
             return;
           }
           helper.uralpro.set("_saveInProgress", true);
@@ -3008,6 +3508,7 @@ ${event.error.stack.split("\n").join("\n")}`;
             };
             const saveDataOld1 = helper.uralpro.get("saveDataOld1");
             const saveDataOld2 = helper.uralpro.get("saveDataOld2");
+            saveDataOld1.clear();
             for (let i = 0; i < helper.uralpro.save_idArray.length; i++) {
               const idname = prefix() + helper.uralpro.save_idArray[i][0];
               const dataN = mapDataApp().get(idname);
@@ -3016,68 +3517,65 @@ ${event.error.stack.split("\n").join("\n")}`;
             }
             if (!utils.areMapsEqual(saveDataOld1, saveDataOld2)) {
               const saveTarget = helper.uralpro.get("getPlayer") == PLATFORM_YANDEX ? PLATFORM_YANDEX : helper.platform;
+              const canWriteYandexCloud = helper.uralpro.get("_yandexCloudDataReady") === true;
+              const nextSnapshot = new Map(saveDataOld1);
               const str = (v) => String(v != null ? v : "");
+              let saveApplied = true;
               if ((saveTarget === PLATFORM_VK || saveTarget === PLATFORM_OK) && ((_b = (_a2 = helper.vk) == null ? void 0 : _a2.storage) == null ? void 0 : _b.setBlob)) {
-                const mapApp = mapDataApp();
-                const payload = [];
-                for (let i = 0; i < helper.uralpro.save_idArray.length; i++) {
-                  const idname = prefix() + helper.uralpro.save_idArray[i][0];
-                  const dataN = mapApp.get(idname);
-                  const key = helper.uralpro.save_idArray[i][0];
-                  const dataStr = str(normalizeForSave(dataN, key));
-                  saveDataOld2.set(idname, dataStr);
-                  payload.push([idname, dataStr]);
-                }
-                try {
-                  yield helper.vk.storage.setBlob(JSON.stringify(payload));
-                } catch (e) {
-                  helper.uralpro.error("\u041E\u0448\u0438\u0431\u043A\u0430 \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u0438\u044F \u0432 VK Storage:", e);
+                const payload = Array.from(nextSnapshot.entries());
+                const serializedPayload = JSON.stringify(payload);
+                if (helper.uralpro.get("_vkCloudWriteReady") !== true) {
+                  saveApplied = false;
                   try {
-                    localStorage.setItem(helper.uralpro.save_id000 + "_data", JSON.stringify(payload));
+                    localStorage.setItem(helper.uralpro.save_id000 + "_data", serializedPayload);
                   } catch (e2) {
+                  }
+                  helper.uralpro.warn("VK/OK Storage: cloud write \u043F\u0440\u043E\u043F\u0443\u0449\u0435\u043D \u2014 \u043F\u0440\u0435\u0434\u044B\u0434\u0443\u0449\u0430\u044F \u043E\u0431\u043B\u0430\u0447\u043D\u0430\u044F \u0432\u0435\u0440\u0441\u0438\u044F \u0437\u0430\u0449\u0438\u0449\u0435\u043D\u0430.");
+                } else {
+                  try {
+                    yield helper.vk.storage.setBlob(serializedPayload);
+                  } catch (e) {
+                    saveApplied = false;
+                    helper.uralpro.error("\u041E\u0448\u0438\u0431\u043A\u0430 \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u0438\u044F \u0432 VK Storage:", e);
+                    try {
+                      localStorage.setItem(helper.uralpro.save_id000 + "_data", serializedPayload);
+                    } catch (e2) {
+                    }
                   }
                 }
               } else if (saveTarget === PLATFORM_CRAZYGAMES && ((_d = (_c = helper.crazygames) == null ? void 0 : _c.storage) == null ? void 0 : _d.setBlob)) {
-                const mapApp = mapDataApp();
-                const payload = [];
-                for (let i = 0; i < helper.uralpro.save_idArray.length; i++) {
-                  const idname = prefix() + helper.uralpro.save_idArray[i][0];
-                  const dataN = mapApp.get(idname);
-                  const key = helper.uralpro.save_idArray[i][0];
-                  const dataStr = str(normalizeForSave(dataN, key));
-                  saveDataOld2.set(idname, dataStr);
-                  payload.push([idname, dataStr]);
-                }
+                const payload = Array.from(nextSnapshot.entries());
                 try {
                   yield helper.crazygames.storage.setBlob(JSON.stringify(payload));
                 } catch (e) {
+                  saveApplied = false;
                   helper.uralpro.error("\u041E\u0448\u0438\u0431\u043A\u0430 \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u0438\u044F \u0432 CrazyGames Storage:", e);
                 }
               } else if (saveTarget === PLATFORM_GAMEPIX && ((_f = (_e = helper.gamepix) == null ? void 0 : _e.storage) == null ? void 0 : _f.setBlob)) {
-                const mapApp = mapDataApp();
-                const payload = [];
-                for (let i = 0; i < helper.uralpro.save_idArray.length; i++) {
-                  const idname = prefix() + helper.uralpro.save_idArray[i][0];
-                  const dataN = mapApp.get(idname);
-                  const key = helper.uralpro.save_idArray[i][0];
-                  const dataStr = str(normalizeForSave(dataN, key));
-                  saveDataOld2.set(idname, dataStr);
-                  payload.push([idname, dataStr]);
-                }
+                const payload = Array.from(nextSnapshot.entries());
                 try {
-                  helper.gamepix.storage.setBlob(JSON.stringify(payload));
+                  yield helper.gamepix.storage.setBlob(JSON.stringify(payload));
                 } catch (e) {
+                  saveApplied = false;
                   helper.uralpro.error("\u041E\u0448\u0438\u0431\u043A\u0430 \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u0438\u044F \u0432 GamePix Storage:", e);
+                }
+              } else if (saveTarget === PLATFORM_YOUTUBE && ((_g = helper._platformAdapter) == null ? void 0 : _g.saveData)) {
+                try {
+                  const payload = filterCloudSavePayload(helper, Array.from(nextSnapshot.entries()));
+                  yield helper._platformAdapter.saveData(payload);
+                } catch (e) {
+                  saveApplied = false;
+                  helper.uralpro.error("\u041E\u0448\u0438\u0431\u043A\u0430 \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u0438\u044F \u0432 YouTube Playables:", e);
                 }
               } else {
                 for (let i = 0; i < helper.uralpro.save_idArray.length; i++) {
                   const idname = prefix() + helper.uralpro.save_idArray[i][0];
-                  const dataN = mapDataApp().get(idname);
-                  const key = helper.uralpro.save_idArray[i][0];
-                  const dataToSave = normalizeForSave(dataN, key);
+                  const dataToSave = nextSnapshot.get(idname);
                   switch (saveTarget) {
                     case PLATFORM_YANDEX:
-                      saveDataOld2.set(idname, str(dataToSave));
+                      if (!canWriteYandexCloud) {
+                        localStorage.setItem(idname, str(dataToSave));
+                      }
                       break;
                     case PLATFORM_VK:
                     case PLATFORM_OK:
@@ -3085,31 +3583,42 @@ ${event.error.stack.split("\n").join("\n")}`;
                         if (!helper.vk || !helper.vk.storage || typeof helper.vk.storage.setLarge !== "function") {
                           helper.uralpro.error("VK/OK storage API \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D. \u0421\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u0438\u0435 \u0432 localStorage.");
                           localStorage.setItem(idname, str(dataToSave));
-                          saveDataOld2.set(idname, str(dataToSave));
                         } else {
                           yield helper.vk.storage.setLarge(idname, dataToSave);
-                          saveDataOld2.set(idname, str(dataToSave));
                         }
                       } catch (e) {
+                        saveApplied = false;
                         helper.uralpro.error("\u041E\u0448\u0438\u0431\u043A\u0430 \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u0438\u044F \u0432 VK/OK Storage:", e);
                         localStorage.setItem(idname, str(dataToSave));
                       }
                       break;
                     case PLATFORM_PLAYDECK:
-                      saveDataOld2.set(idname, str(dataToSave));
+                    case PLATFORM_YOUTUBE:
                       break;
                     default:
                       localStorage.setItem(idname, str(dataToSave));
-                      saveDataOld2.set(idname, str(dataToSave));
                       break;
                   }
                 }
               }
-              if (saveTarget === PLATFORM_PLAYDECK && ((_g = helper._platformAdapter) == null ? void 0 : _g.saveData)) {
+              if (saveTarget === PLATFORM_PLAYDECK && ((_h = helper._platformAdapter) == null ? void 0 : _h.saveData)) {
                 try {
                   helper._platformAdapter.saveData();
                 } catch (e) {
+                  saveApplied = false;
                   helper.uralpro.error("\u041E\u0448\u0438\u0431\u043A\u0430 \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u0438\u044F \u0447\u0435\u0440\u0435\u0437 PlayDeck \u0430\u0434\u0430\u043F\u0442\u0435\u0440:", e);
+                }
+              }
+              if (saveTarget === PLATFORM_YOUTUBE && ((_i = helper._platformAdapter) == null ? void 0 : _i.sendScore)) {
+                const scoreKey = (_j = helper.uralpro.config) == null ? void 0 : _j.youtubeScoreKey;
+                if (scoreKey) {
+                  try {
+                    const score = Number(helper.getData(scoreKey));
+                    if (Number.isFinite(score)) {
+                      helper._platformAdapter.sendScore(score);
+                    }
+                  } catch (e) {
+                  }
                 }
               }
               const platform = helper.platform;
@@ -3117,14 +3626,57 @@ ${event.error.stack.split("\n").join("\n")}`;
               switch (platform) {
                 case PLATFORM_YANDEX:
                   if (helper.uralpro.get("getPlayer") == PLATFORM_YANDEX) {
-                    helper.uralpro.get("_player").setData({
-                      data: Array.from(saveDataOld2)
-                    }).then(() => {
+                    if (!canWriteYandexCloud) {
+                      saveApplied = false;
+                      helper.uralpro.warn("Yandex Games: \u043E\u0431\u043B\u0430\u0447\u043D\u043E\u0435 \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u0438\u0435 \u0432\u0440\u0435\u043C\u0435\u043D\u043D\u043E \u043E\u0442\u043A\u043B\u044E\u0447\u0435\u043D\u043E \u0434\u043E \u0443\u0441\u043F\u0435\u0448\u043D\u043E\u0439 \u0437\u0430\u0433\u0440\u0443\u0437\u043A\u0438 \u0434\u0430\u043D\u043D\u044B\u0445 \u0438\u0433\u0440\u043E\u043A\u0430.");
+                      break;
+                    }
+                    const yPlayer = helper.uralpro.get("_player");
+                    if (!yPlayer || typeof yPlayer.setData !== "function") {
+                      saveApplied = false;
+                      helper.uralpro.warn("Yandex Games: setData \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D (\u043D\u0435\u0442 \u043E\u0431\u044A\u0435\u043A\u0442\u0430 \u0438\u0433\u0440\u043E\u043A\u0430).");
+                      break;
+                    }
+                    const payload = { data: Array.from(nextSnapshot.entries()) };
+                    let payloadBytes = 0;
+                    try {
+                      const json = JSON.stringify(payload);
+                      payloadBytes = typeof TextEncoder !== "undefined" ? new TextEncoder().encode(json).length : json.length * 2;
+                    } catch (e) {
+                    }
+                    if (payloadBytes > 200 * 1024) {
+                      saveApplied = false;
+                      helper.uralpro.warn(
+                        `Yandex Games: \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u0438\u0435 \u043D\u0435 \u043E\u0442\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u043E \u2014 ${payloadBytes} \u0431\u0430\u0439\u0442 \u043F\u0440\u0435\u0432\u044B\u0448\u0430\u044E\u0442 \u043B\u0438\u043C\u0438\u0442 200 \u041A\u0411.`
+                      );
+                      break;
+                    }
+                    const setReq = yPlayer.setData(payload, (options == null ? void 0 : options.flush) === true);
+                    let yandexCloudOk = false;
+                    if (setReq != null && typeof setReq.then === "function") {
+                      yield setReq.then(() => {
+                        yandexCloudOk = true;
+                      }).catch((e) => {
+                        saveApplied = false;
+                        helper.uralpro.warn(
+                          "Yandex Games: \u043E\u0431\u043B\u0430\u0447\u043D\u043E\u0435 \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u0438\u0435 (setData) \u043D\u0435 \u0432\u044B\u043F\u043E\u043B\u043D\u0435\u043D\u043E. \u0414\u0430\u043D\u043D\u044B\u0435 \u0432 \u043F\u0430\u043C\u044F\u0442\u0438; \u043F\u043E\u0432\u0442\u043E\u0440 \u043F\u0440\u0438 \u0441\u043B\u0435\u0434\u0443\u044E\u0449\u0435\u043C save.",
+                          e
+                        );
+                      });
+                    } else {
+                      yandexCloudOk = true;
+                    }
+                    if (yandexCloudOk) {
                       helper.uralpro.log("SaveData [Yandex Games]", logStyle);
                       localStorage.setItem("uralpro_lastSaveTime", Date.now().toString());
                       if (helper.uralpro.config.codeAfterSaving)
                         helper.uralpro.config.codeAfterSaving();
-                    });
+                    } else {
+                      try {
+                        localStorage.setItem("uralpro_lastSaveTime", Date.now().toString());
+                      } catch (e) {
+                      }
+                    }
                   }
                   break;
                 case PLATFORM_VK:
@@ -3136,7 +3688,7 @@ ${event.error.stack.split("\n").join("\n")}`;
                 case PLATFORM_GAMEPIX:
                   helper.uralpro.log("SaveData [GamePix.localStorage]", logStyle);
                   try {
-                    if ((_i = (_h = window.GamePix) == null ? void 0 : _h.localStorage) == null ? void 0 : _i.setItem) {
+                    if ((_l = (_k = window.GamePix) == null ? void 0 : _k.localStorage) == null ? void 0 : _l.setItem) {
                       window.GamePix.localStorage.setItem("uralpro_lastSaveTime", Date.now().toString());
                     }
                   } catch (e) {
@@ -3146,6 +3698,11 @@ ${event.error.stack.split("\n").join("\n")}`;
                   break;
                 case PLATFORM_PLAYDECK:
                   helper.uralpro.log("SaveData [PlayDeck internal]", logStyle);
+                  if (helper.uralpro.config.codeAfterSaving)
+                    helper.uralpro.config.codeAfterSaving();
+                  break;
+                case PLATFORM_YOUTUBE:
+                  helper.uralpro.log("SaveData [YouTube Playables]", logStyle);
                   if (helper.uralpro.config.codeAfterSaving)
                     helper.uralpro.config.codeAfterSaving();
                   break;
@@ -3161,14 +3718,24 @@ ${event.error.stack.split("\n").join("\n")}`;
                     helper.uralpro.config.codeAfterSaving();
                   break;
               }
+              if (saveApplied) {
+                saveDataOld2.clear();
+                nextSnapshot.forEach((value, key) => {
+                  saveDataOld2.set(key, value);
+                });
+              } else {
+                helper.uralpro.log("SaveData deferred [will retry]", helper.uralpro.logStyle("#707344", "black"));
+              }
             } else {
               helper.uralpro.log("NoSaveData [No changes]", helper.uralpro.logStyle("#707344", "black"));
             }
           } finally {
             helper.uralpro.set("_saveInProgress", false);
             if (helper.uralpro.get("_savePending")) {
+              const pendingFlush = helper.uralpro.get("_savePendingFlush") === true;
               helper.uralpro.set("_savePending", false);
-              api.saveDataUrgently();
+              helper.uralpro.set("_savePendingFlush", false);
+              api.saveDataUrgently({ flush: pendingFlush });
             }
           }
         });
@@ -3179,6 +3746,7 @@ ${event.error.stack.split("\n").join("\n")}`;
 
   // src/modules/platforms/platform_definition.js
   function detectPlatform() {
+    var _a;
     const protocol = window.location.protocol;
     const href = window.location.href;
     const host = window.location.hostname.toLowerCase();
@@ -3188,6 +3756,8 @@ ${event.error.stack.split("\n").join("\n")}`;
     const isVkLaunch = host === "vk.com" || host.endsWith(".vk.com") || host === "vk.ru" || host.endsWith(".vk.ru") || searchParams.has("vk_app_id") || searchParams.has("vk_platform") || searchParams.has("vk_user_id") || searchParams.has("sign");
     if (protocol === "file:") {
       return PLATFORM_FILE;
+    } else if (typeof window.ytgame !== "undefined" && ((_a = window.ytgame) == null ? void 0 : _a.IN_PLAYABLES_ENV)) {
+      return PLATFORM_YOUTUBE;
     } else if (href.includes("yandex")) {
       return PLATFORM_YANDEX;
     } else if (href.includes("poki.com") || href.includes("poki")) {
@@ -3234,7 +3804,7 @@ ${event.error.stack.split("\n").join("\n")}`;
   }
 
   // src/modules/platforms/yandex/index.js
-  function createAdapter(helper) {
+  function createAdapter3(helper) {
     const storage = typeof localStorage !== "undefined" ? localStorage : { getItem: () => null, setItem: () => {
     } };
     return {
@@ -3335,7 +3905,7 @@ ${event.error.stack.split("\n").join("\n")}`;
       isReady: () => !!helper.uralpro.get("isSdkReady")
     };
   }
-  function setup(helper, context) {
+  function setup3(helper, context) {
     return __async(this, null, function* () {
       try {
         helper.uralpro.set("sdk", yield YaGames.init());
@@ -3394,59 +3964,9 @@ ${event.error.stack.split("\n").join("\n")}`;
         }).catch((err) => helper.uralpro.error("\u041E\u0448\u0438\u0431\u043A\u0430 getPayments:", err));
       } catch (error) {
         helper.uralpro.error("\u041E\u0448\u0438\u0431\u043A\u0430 \u0438\u043D\u0438\u0446\u0438\u0430\u043B\u0438\u0437\u0430\u0446\u0438\u0438 Yandex SDK:", error);
-        setTimeout(() => setup(helper, context), 1e3);
+        setTimeout(() => setup3(helper, context), 1e3);
       }
     });
-  }
-
-  // src/modules/platforms/file/index.js
-  function createAdapter2(helper) {
-    const storage = typeof localStorage !== "undefined" ? localStorage : { getItem: () => null, setItem: () => {
-    } };
-    return {
-      getSdk: () => null,
-      getCooldownStorage: () => storage,
-      showFullscreenAd() {
-        return __async(this, null, function* () {
-        });
-      },
-      showRewardedAd() {
-        return __async(this, null, function* () {
-        });
-      },
-      showBanner() {
-      },
-      getLang: () => helper.uralpro.get("lang") || "en",
-      pause: () => {
-        var _a2, _b, _c;
-        if ((_a2 = helper.uralpro.config) == null ? void 0 : _a2.audioMuteDocumentVisibility)
-          try {
-            (_c = (_b = helper.audio) == null ? void 0 : _b.muteAll) == null ? void 0 : _c.call(_b);
-          } catch (e) {
-          }
-      },
-      resume: () => {
-        var _a2, _b, _c;
-        if ((_a2 = helper.uralpro.config) == null ? void 0 : _a2.audioMuteDocumentVisibility)
-          try {
-            (_c = (_b = helper.audio) == null ? void 0 : _b.unmuteAll) == null ? void 0 : _c.call(_b);
-          } catch (e) {
-          }
-      },
-      isReady: () => true
-    };
-  }
-  function setup2(helper, context) {
-    const urlLang = new URLSearchParams(window.location.search).get("lang");
-    const defaultLang = window.navigator.language.slice(0, 2);
-    helper.uralpro.set("lang", urlLang || defaultLang);
-    context.loadStartData();
-    helper.uralpro.set("isLoaded", true);
-    helper.uralpro.set("isSdkReady", true);
-    helper.uralpro.set("isSdkReadyData", true);
-    helper.uralpro.set("setup_saveData", 1);
-    helper.saveData();
-    setInterval(helper.saveData, 1e3 * 60);
   }
 
   // src/modules/platforms/vk/module.js
@@ -3463,6 +3983,7 @@ ${event.error.stack.split("\n").join("\n")}`;
       _chunkSize: 2e3,
       _metaSuffix: "__p_count",
       _partPrefix: "__p_",
+      _txManifest: null,
       _isMetaKey: (k) => typeof k === "string" && k.endsWith("__p_count"),
       _isPartKey: (k) => typeof k === "string" && k.includes("__p_"),
       _splitIntoChunks(str, chunkSize) {
@@ -3563,77 +4084,222 @@ ${event.error.stack.split("\n").join("\n")}`;
       },
       /** Ключ одного blob в VK (как в Yandex — всё состояние одним запросом). */
       _blobKey: () => helper.uralpro.save_id000 + "_data",
-      /** Загрузить один blob из VK (формат как Yandex: массив [[key, value], ...]). При недоступности VK — из localStorage. */
-      getBlob: () => __async(this, null, function* () {
-        const blobKey = api.storage._blobKey();
-        const fromLocal = () => {
-          try {
-            return typeof localStorage !== "undefined" ? localStorage.getItem(blobKey) : null;
-          } catch (e) {
-            return null;
+      _txManifestKey: () => api.storage._blobKey() + "__tx_manifest",
+      _txSlotKey: (slot) => api.storage._blobKey() + "__tx_" + slot,
+      _checksum(value) {
+        const text = String(value != null ? value : "");
+        let hash = 2166136261;
+        for (let i = 0; i < text.length; i++) {
+          hash ^= text.charCodeAt(i);
+          hash = Math.imul(hash, 16777619);
+        }
+        return (hash >>> 0).toString(16).padStart(8, "0");
+      },
+      _isSerializedPayload(value) {
+        if (typeof value !== "string" || value.length === 0)
+          return false;
+        try {
+          const parsed = JSON.parse(value);
+          return Array.isArray(parsed) && parsed.every((entry) => Array.isArray(entry) && entry.length >= 2);
+        } catch (e) {
+          return false;
+        }
+      },
+      _readLocalBlob() {
+        try {
+          return typeof localStorage !== "undefined" ? localStorage.getItem(api.storage._blobKey()) : null;
+        } catch (e) {
+          return null;
+        }
+      },
+      _writeLocalBlob(value) {
+        try {
+          if (typeof localStorage !== "undefined") {
+            localStorage.setItem(api.storage._blobKey(), String(value != null ? value : ""));
           }
-        };
-        const bridge = api.storage._getBridge();
-        if (!(bridge == null ? void 0 : bridge.send))
-          return fromLocal();
+        } catch (e) {
+        }
+      },
+      _descriptorMatches(value, descriptor) {
+        if (typeof value !== "string" || !descriptor || typeof descriptor !== "object")
+          return false;
+        const expectedLength = Number(descriptor.length);
+        if (!Number.isFinite(expectedLength) || value.length !== expectedLength)
+          return false;
+        if (String(descriptor.checksum || "") !== api.storage._checksum(value))
+          return false;
+        return api.storage._isSerializedPayload(value);
+      },
+      _fetchBlobRaw: () => __async(this, null, function* () {
+        const blobKey = api.storage._blobKey();
         const allKeys = [];
         let offset = 0;
         const count = 100;
-        for (let g = 0; g < 50; g++) {
-          const res2 = yield api.storage._send("VKWebAppStorageGetKeys", { count, offset });
-          const keys = Array.isArray(res2 == null ? void 0 : res2.keys) ? res2.keys : [];
+        for (let guard = 0; guard < 200; guard++) {
+          const res = yield api.storage._send("VKWebAppStorageGetKeys", { count, offset });
+          const keys = Array.isArray(res == null ? void 0 : res.keys) ? res.keys : [];
           if (keys.length === 0)
             break;
-          const relevant = keys.filter((k) => k === blobKey || k === blobKey + api.storage._metaSuffix || typeof k === "string" && k.startsWith(blobKey + api.storage._partPrefix));
-          allKeys.push(...relevant);
+          for (const key of keys) {
+            if (key === blobKey || typeof key === "string" && key.startsWith(blobKey + "__")) {
+              allKeys.push(key);
+            }
+          }
           if (keys.length < count)
             break;
           offset += keys.length;
         }
-        const unique = [...new Set(allKeys)];
-        if (unique.length === 0)
-          return null;
-        const res = yield api.storage._send("VKWebAppStorageGet", { keys: unique });
         const raw = /* @__PURE__ */ new Map();
-        const pairs = Array.isArray(res == null ? void 0 : res.keys) ? res.keys : [];
-        for (const kv of pairs) {
-          if (kv && typeof kv.key === "string")
-            raw.set(kv.key, kv.value);
+        const unique = [...new Set(allKeys)];
+        for (let i = 0; i < unique.length; i += 100) {
+          const res = yield api.storage._send("VKWebAppStorageGet", { keys: unique.slice(i, i + 100) });
+          const pairs = Array.isArray(res == null ? void 0 : res.keys) ? res.keys : [];
+          for (const kv of pairs) {
+            if (kv && typeof kv.key === "string")
+              raw.set(kv.key, kv.value);
+          }
+        }
+        return raw;
+      }),
+      _readBlobState: () => __async(this, null, function* () {
+        var _a, _b;
+        const localBlob = api.storage._readLocalBlob();
+        const localFallback = () => {
+          if (api.storage._isSerializedPayload(localBlob)) {
+            return { status: "local-fallback", source: "local", blob: localBlob };
+          }
+          return null;
+        };
+        const bridge = api.storage._getBridge();
+        if (!(bridge == null ? void 0 : bridge.send)) {
+          const fallback2 = localFallback();
+          if (fallback2)
+            return fallback2;
+          throw new Error("VK Storage \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D, \u0441\u043E\u0441\u0442\u043E\u044F\u043D\u0438\u0435 \u043E\u0431\u043B\u0430\u043A\u0430 \u043D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u043E");
+        }
+        let raw;
+        try {
+          raw = yield api.storage._fetchBlobRaw();
+        } catch (error) {
+          const fallback2 = localFallback();
+          if (fallback2)
+            return __spreadProps(__spreadValues({}, fallback2), { error });
+          throw error;
+        }
+        if (raw.size === 0) {
+          api.storage._txManifest = null;
+          return { status: "empty", source: "cloud", blob: null };
         }
         const resolved = api.storage.resolveChunks(raw);
-        const value = resolved.get(blobKey);
-        if (value != null)
-          return value;
-        return fromLocal();
-      }),
-      /** Сохранить один blob в VK (один вызов setLarge = минимум запросов, как Yandex setData). */
-      setBlob: (blobString) => __async(this, null, function* () {
-        const blobKey = api.storage._blobKey();
-        yield api.storage.setLarge(blobKey, blobString);
-      }),
-      preloadToMap: () => __async(this, null, function* () {
-        try {
-          const blob = yield api.storage.getBlob();
-          const mapApp = helper.uralpro.get("mapDataApp");
-          if (!mapApp)
-            return;
-          if (blob && typeof blob === "string") {
-            try {
-              const data = JSON.parse(blob);
-              if (Array.isArray(data)) {
-                for (const entry of data) {
-                  if (Array.isArray(entry) && entry.length >= 2)
-                    mapApp.set(entry[0], entry[1]);
-                }
-              }
-            } catch (e) {
-              helper.uralpro.warn("VK Storage: \u043E\u0448\u0438\u0431\u043A\u0430 \u043F\u0430\u0440\u0441\u0438\u043D\u0433\u0430 blob", e);
+        const manifestRaw = (_a = resolved.get(api.storage._txManifestKey())) != null ? _a : raw.get(api.storage._txManifestKey());
+        let manifest = null;
+        if (typeof manifestRaw === "string" && manifestRaw) {
+          try {
+            const candidate = JSON.parse(manifestRaw);
+            if ((candidate == null ? void 0 : candidate.version) === 2 && (candidate.active === "a" || candidate.active === "b")) {
+              manifest = candidate;
+            }
+          } catch (e) {
+          }
+        }
+        if (manifest) {
+          const slots = manifest.active === "a" ? ["a", "b"] : ["b", "a"];
+          for (const slot of slots) {
+            const value = resolved.get(api.storage._txSlotKey(slot));
+            const descriptor = (_b = manifest.slots) == null ? void 0 : _b[slot];
+            if (api.storage._descriptorMatches(value, descriptor)) {
+              api.storage._txManifest = manifest;
+              return {
+                status: "loaded",
+                source: slot === manifest.active ? "transaction" : "transaction-fallback",
+                blob: value
+              };
             }
           }
-          helper.uralpro.log(`VK Storage: \u0437\u0430\u0433\u0440\u0443\u0436\u0435\u043D\u043E \u043A\u043B\u044E\u0447\u0435\u0439 ${mapApp.size} (\u043E\u0434\u0438\u043D blob, \u043E\u0434\u043D\u0430 \u043A\u0430\u0440\u0442\u0430 mapDataApp)`, helper.uralpro.logStyle("#2e2727", "#c7d2fe"));
-        } catch (e) {
-          helper.uralpro.warn("VK Storage getBlob:", e);
         }
+        const legacy = resolved.get(api.storage._blobKey());
+        if (api.storage._isSerializedPayload(legacy)) {
+          api.storage._txManifest = manifest;
+          return { status: "loaded", source: "legacy", blob: legacy };
+        }
+        const fallback = localFallback();
+        if (fallback)
+          return __spreadProps(__spreadValues({}, fallback), { error: new Error("\u041E\u0431\u043B\u0430\u0447\u043D\u044B\u0439 blob \u043F\u043E\u0432\u0440\u0435\u0436\u0434\u0451\u043D") });
+        throw new Error("VK Storage \u0441\u043E\u0434\u0435\u0440\u0436\u0438\u0442 \u043D\u0435\u043F\u043E\u043B\u043D\u043E\u0435 \u0438\u043B\u0438 \u043F\u043E\u0432\u0440\u0435\u0436\u0434\u0451\u043D\u043D\u043E\u0435 \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u0438\u0435");
+      }),
+      /** Загрузить blob с поддержкой старого формата и двух транзакционных поколений. */
+      getBlob: () => __async(this, null, function* () {
+        const state = yield api.storage._readBlobState();
+        return state.blob;
+      }),
+      _readLargeKnown: (baseKey, chunkCount) => __async(this, null, function* () {
+        const keys = [baseKey, baseKey + api.storage._metaSuffix];
+        for (let i = 0; i < chunkCount; i++)
+          keys.push(baseKey + api.storage._partPrefix + i);
+        const raw = /* @__PURE__ */ new Map();
+        for (let i = 0; i < keys.length; i += 100) {
+          const res = yield api.storage._send("VKWebAppStorageGet", { keys: keys.slice(i, i + 100) });
+          const pairs = Array.isArray(res == null ? void 0 : res.keys) ? res.keys : [];
+          for (const kv of pairs) {
+            if (kv && typeof kv.key === "string")
+              raw.set(kv.key, kv.value);
+          }
+        }
+        return api.storage.resolveChunks(raw).get(baseKey);
+      }),
+      /** Записать неактивное поколение, проверить его и только затем переключить manifest. */
+      setBlob: (blobString) => __async(this, null, function* () {
+        const value = String(blobString != null ? blobString : "");
+        if (!api.storage._isSerializedPayload(value)) {
+          throw new Error("VK Storage: \u043E\u0442\u043A\u0430\u0437 \u043E\u0442 \u0437\u0430\u043F\u0438\u0441\u0438 \u043D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u043E\u0433\u043E blob");
+        }
+        const previous = api.storage._txManifest;
+        const active = (previous == null ? void 0 : previous.active) === "a" || (previous == null ? void 0 : previous.active) === "b" ? previous.active : null;
+        const target = active === "a" ? "b" : "a";
+        const targetKey = api.storage._txSlotKey(target);
+        const chunkCount = value.length <= api.storage._chunkSize ? 0 : api.storage._splitIntoChunks(value, api.storage._chunkSize).length;
+        yield api.storage.setLarge(targetKey, value);
+        const verified = yield api.storage._readLargeKnown(targetKey, chunkCount);
+        const descriptor = {
+          revision: Math.max(Date.now(), Number((previous == null ? void 0 : previous.revision) || 0) + 1),
+          length: value.length,
+          checksum: api.storage._checksum(value)
+        };
+        if (!api.storage._descriptorMatches(verified, descriptor)) {
+          throw new Error("VK Storage: \u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0430 \u0437\u0430\u043F\u0438\u0441\u0430\u043D\u043D\u043E\u0433\u043E \u043F\u043E\u043A\u043E\u043B\u0435\u043D\u0438\u044F \u043D\u0435 \u043F\u0440\u043E\u0439\u0434\u0435\u043D\u0430");
+        }
+        const manifest = {
+          version: 2,
+          active: target,
+          revision: descriptor.revision,
+          slots: __spreadProps(__spreadValues({}, (previous == null ? void 0 : previous.slots) || {}), { [target]: descriptor })
+        };
+        yield api.storage._send("VKWebAppStorageSet", {
+          key: api.storage._txManifestKey(),
+          value: JSON.stringify(manifest)
+        });
+        api.storage._txManifest = manifest;
+        api.storage._writeLocalBlob(value);
+      }),
+      preloadToMap: () => __async(this, null, function* () {
+        const state = yield api.storage._readBlobState();
+        const mapApp = helper.uralpro.get("mapDataApp");
+        if (!mapApp)
+          throw new Error("VK Storage: mapDataApp \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u043D\u0430");
+        if (state.blob != null) {
+          const data = JSON.parse(state.blob);
+          if (!Array.isArray(data))
+            throw new Error("VK Storage: blob \u0438\u043C\u0435\u0435\u0442 \u043D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u044B\u0439 \u0444\u043E\u0440\u043C\u0430\u0442");
+          for (const entry of data) {
+            if (Array.isArray(entry) && entry.length >= 2)
+              mapApp.set(entry[0], entry[1]);
+          }
+        }
+        helper.uralpro.log(
+          `VK Storage: \u0437\u0430\u0433\u0440\u0443\u0436\u0435\u043D\u043E \u043A\u043B\u044E\u0447\u0435\u0439 ${mapApp.size}, \u0438\u0441\u0442\u043E\u0447\u043D\u0438\u043A ${state.source}`,
+          helper.uralpro.logStyle("#2e2727", "#c7d2fe")
+        );
+        return __spreadProps(__spreadValues({}, state), { loadedKeys: mapApp.size });
       }),
       setLarge: (baseKey, value) => __async(this, null, function* () {
         const bridge = api.storage._getBridge();
@@ -3815,7 +4481,7 @@ ${event.error.stack.split("\n").join("\n")}`;
   }
 
   // src/modules/platforms/vk/index.js
-  function createAdapter3(helper) {
+  function createAdapter4(helper) {
     const storage = typeof localStorage !== "undefined" ? localStorage : { getItem: () => null, setItem: () => {
     } };
     return {
@@ -3917,7 +4583,7 @@ ${event.error.stack.split("\n").join("\n")}`;
       isReady: () => !!helper.uralpro.get("isSdkReady")
     };
   }
-  function setup3(helper, context) {
+  function setup4(helper, context) {
     return __async(this, null, function* () {
       try {
         helper.vk = createVkModule(helper);
@@ -3933,7 +4599,7 @@ ${event.error.stack.split("\n").join("\n")}`;
           const bridge = window.vkBridge;
           if (!bridge || typeof bridge.send !== "function") {
             helper.uralpro.error("vkBridge \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D \u0438\u043B\u0438 \u043D\u0435 \u043F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442 send().");
-            setup2(helper, context);
+            setup(helper, context);
             return;
           }
           helper.uralpro.set("isLoaded", true);
@@ -4088,16 +4754,34 @@ ${event.error.stack.split("\n").join("\n")}`;
           };
           helper.uralpro.set("sdk", vkSdk);
           helper.uralpro.set("isSdkReady", true);
-          try {
-            yield helper.vk.storage.preloadToMap();
-            helper.uralpro.log("VK Storage: \u0434\u0430\u043D\u043D\u044B\u0435 \u0443\u0441\u043F\u0435\u0448\u043D\u043E \u0437\u0430\u0433\u0440\u0443\u0436\u0435\u043D\u044B");
-          } catch (e) {
-            helper.uralpro.warn("\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u043E\u0434\u0433\u0440\u0443\u0437\u0438\u0442\u044C VK Storage (\u043F\u0440\u043E\u0434\u043E\u043B\u0436\u0430\u0435\u043C \u0440\u0430\u0431\u043E\u0442\u0443):", e);
+          let preloadResult = null;
+          let preloadError = null;
+          for (let attempt = 1; attempt <= 3 && !preloadResult; attempt++) {
+            try {
+              preloadResult = yield helper.vk.storage.preloadToMap();
+            } catch (e) {
+              preloadError = e;
+              helper.uralpro.warn(`VK Storage: \u043E\u0448\u0438\u0431\u043A\u0430 \u0447\u0442\u0435\u043D\u0438\u044F, \u043F\u043E\u043F\u044B\u0442\u043A\u0430 ${attempt}/3`, e);
+              if (attempt < 3)
+                yield new Promise((resolve) => setTimeout(resolve, 1e3 * attempt));
+            }
+          }
+          const cloudWriteReady = (preloadResult == null ? void 0 : preloadResult.status) === "loaded" || (preloadResult == null ? void 0 : preloadResult.status) === "empty";
+          helper.uralpro.set("_vkCloudWriteReady", cloudWriteReady);
+          helper.uralpro.set("_vkCloudLoadState", (preloadResult == null ? void 0 : preloadResult.status) || "error");
+          if (cloudWriteReady) {
+            helper.uralpro.log(`VK Storage: \u0434\u0430\u043D\u043D\u044B\u0435 \u0437\u0430\u0433\u0440\u0443\u0436\u0435\u043D\u044B (${preloadResult.status})`);
+          } else {
+            helper.uralpro.warn(
+              "VK/OK Storage: \u043E\u0431\u043B\u0430\u0447\u043D\u0430\u044F \u0437\u0430\u043F\u0438\u0441\u044C \u0437\u0430\u0431\u043B\u043E\u043A\u0438\u0440\u043E\u0432\u0430\u043D\u0430 \u0434\u043E \u0441\u043B\u0435\u0434\u0443\u044E\u0449\u0435\u0433\u043E \u0443\u0441\u043F\u0435\u0448\u043D\u043E\u0433\u043E \u0437\u0430\u043F\u0443\u0441\u043A\u0430; \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u0435\u0442\u0441\u044F \u043B\u043E\u043A\u0430\u043B\u044C\u043D\u0430\u044F \u0440\u0435\u0437\u0435\u0440\u0432\u043D\u0430\u044F \u043A\u043E\u043F\u0438\u044F.",
+              preloadError || (preloadResult == null ? void 0 : preloadResult.error)
+            );
           }
           context.loadStartData();
           helper.uralpro.set("isSdkReadyData", true);
           helper.uralpro.set("setup_saveData", 1);
-          helper.saveData();
+          if (cloudWriteReady)
+            helper.saveData();
           setInterval(helper.saveData, 1e3 * 60);
           helper.uralpro.log("VK SDK (vk-bridge) \u043D\u0430\u0441\u0442\u0440\u043E\u0435\u043D.");
         });
@@ -4126,30 +4810,30 @@ ${event.error.stack.split("\n").join("\n")}`;
           }
           if (!loaded) {
             helper.uralpro.error("\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044C vk-bridge. \u041F\u0435\u0440\u0435\u0445\u043E\u0434\u0438\u043C \u0432 \u043B\u043E\u043A\u0430\u043B\u044C\u043D\u044B\u0439 \u0440\u0435\u0436\u0438\u043C.");
-            setup2(helper, context);
+            setup(helper, context);
             return;
           }
         }
         yield startWithBridge();
       } catch (error) {
         helper.uralpro.error("\u041E\u0448\u0438\u0431\u043A\u0430 \u0438\u043D\u0438\u0446\u0438\u0430\u043B\u0438\u0437\u0430\u0446\u0438\u0438 VK SDK:", error);
-        setup2(helper, context);
+        setup(helper, context);
       }
     });
   }
 
   // src/modules/platforms/ok/index.js
-  function createAdapter4(helper) {
-    return createAdapter3(helper);
+  function createAdapter5(helper) {
+    return createAdapter4(helper);
   }
-  function setup4(helper, context) {
+  function setup5(helper, context) {
     return __async(this, null, function* () {
-      return setup3(helper, context);
+      return setup4(helper, context);
     });
   }
 
   // src/modules/platforms/poki/index.js
-  function createAdapter5(helper) {
+  function createAdapter6(helper) {
     const storage = typeof localStorage !== "undefined" ? localStorage : { getItem: () => null, setItem: () => {
     } };
     return {
@@ -4221,12 +4905,12 @@ ${event.error.stack.split("\n").join("\n")}`;
       isReady: () => !!helper.uralpro.get("isSdkReady")
     };
   }
-  function setup5(helper, context) {
+  function setup6(helper, context) {
     return __async(this, null, function* () {
       try {
         if (typeof PokiSDK === "undefined") {
           helper.uralpro.error("PokiSDK \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D. \u0423\u0431\u0435\u0434\u0438\u0442\u0435\u0441\u044C, \u0447\u0442\u043E \u0441\u043A\u0440\u0438\u043F\u0442 \u0437\u0430\u0433\u0440\u0443\u0436\u0435\u043D.");
-          setup2(helper, context);
+          setup(helper, context);
           return;
         }
         yield PokiSDK.init();
@@ -4244,7 +4928,7 @@ ${event.error.stack.split("\n").join("\n")}`;
         helper.uralpro.log("Poki SDK \u043D\u0430\u0441\u0442\u0440\u043E\u0435\u043D.");
       } catch (error) {
         helper.uralpro.error("\u041E\u0448\u0438\u0431\u043A\u0430 \u0438\u043D\u0438\u0446\u0438\u0430\u043B\u0438\u0437\u0430\u0446\u0438\u0438 Poki SDK:", error);
-        setup2(helper, context);
+        setup(helper, context);
       }
     });
   }
@@ -4352,7 +5036,7 @@ ${event.error.stack.split("\n").join("\n")}`;
       }
     };
   }
-  function createAdapter6(helper) {
+  function createAdapter7(helper) {
     const storage = typeof localStorage !== "undefined" ? localStorage : { getItem: () => null, setItem: () => {
     } };
     return {
@@ -4519,21 +5203,21 @@ ${event.error.stack.split("\n").join("\n")}`;
       isReady: () => !!helper.uralpro.get("isSdkReady")
     };
   }
-  function setup6(helper, context) {
+  function setup7(helper, context) {
     return __async(this, null, function* () {
       var _a;
       try {
         const CG = (_a = window.CrazyGames) == null ? void 0 : _a.SDK;
         if (!CG) {
           helper.uralpro.error("CrazyGames SDK \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D. \u041F\u043E\u0434\u043A\u043B\u044E\u0447\u0438\u0442\u0435 https://sdk.crazygames.com/crazygames-sdk-v3.js");
-          setup2(helper, context);
+          setup(helper, context);
           return;
         }
         yield CG.init();
         const env = CG.environment;
         if (env === "disabled") {
           helper.uralpro.warn("CrazyGames SDK \u0432 \u0440\u0435\u0436\u0438\u043C\u0435 disabled. \u0418\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u0435\u0442\u0441\u044F \u043B\u043E\u043A\u0430\u043B\u044C\u043D\u043E\u0435 \u043E\u043A\u0440\u0443\u0436\u0435\u043D\u0438\u0435.");
-          setup2(helper, context);
+          setup(helper, context);
           return;
         }
         helper.uralpro.set("sdk", CG);
@@ -4557,7 +5241,7 @@ ${event.error.stack.split("\n").join("\n")}`;
         helper.uralpro.log("CrazyGames SDK \u043D\u0430\u0441\u0442\u0440\u043E\u0435\u043D.");
       } catch (error) {
         helper.uralpro.error("\u041E\u0448\u0438\u0431\u043A\u0430 \u0438\u043D\u0438\u0446\u0438\u0430\u043B\u0438\u0437\u0430\u0446\u0438\u0438 CrazyGames SDK:", error);
-        setup2(helper, context);
+        setup(helper, context);
       }
     });
   }
@@ -4853,7 +5537,7 @@ ${event.error.stack.split("\n").join("\n")}`;
   }
 
   // src/modules/platforms/gamepix/index.js
-  function createAdapter7(helper) {
+  function createAdapter8(helper) {
     var _a;
     const storage = typeof window !== "undefined" && ((_a = window.GamePix) == null ? void 0 : _a.localStorage) ? window.GamePix.localStorage : typeof localStorage !== "undefined" ? localStorage : { getItem: () => null, setItem: () => {
     } };
@@ -5015,14 +5699,14 @@ ${event.error.stack.split("\n").join("\n")}`;
       ensureLoaded
     };
   }
-  function setup7(helper, context) {
+  function setup8(helper, context) {
     return __async(this, null, function* () {
       var _a, _b;
       try {
         helper.gamepix = createGamepixModule(helper);
         if (typeof window.GamePix === "undefined") {
           helper.uralpro.error("GamePix SDK \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D. \u0423\u0431\u0435\u0434\u0438\u0442\u0435\u0441\u044C, \u0447\u0442\u043E \u0441\u043A\u0440\u0438\u043F\u0442 \u0437\u0430\u0433\u0440\u0443\u0436\u0435\u043D.");
-          setup2(helper, context);
+          setup(helper, context);
           return;
         }
         helper.uralpro.set("sdk", window.GamePix);
@@ -5102,7 +5786,7 @@ ${event.error.stack.split("\n").join("\n")}`;
         helper.uralpro.log("GamePix SDK \u043D\u0430\u0441\u0442\u0440\u043E\u0435\u043D.");
       } catch (error) {
         helper.uralpro.error("\u041E\u0448\u0438\u0431\u043A\u0430 \u0438\u043D\u0438\u0446\u0438\u0430\u043B\u0438\u0437\u0430\u0446\u0438\u0438 GamePix SDK:", error);
-        setup2(helper, context);
+        setup(helper, context);
       }
     });
   }
@@ -5118,7 +5802,7 @@ ${event.error.stack.split("\n").join("\n")}`;
     }
     return null;
   }
-  function createAdapter8(helper) {
+  function createAdapter9(helper) {
     const storage = typeof localStorage !== "undefined" ? localStorage : { getItem: () => null, setItem: () => {
     } };
     return {
@@ -5193,8 +5877,8 @@ ${event.error.stack.split("\n").join("\n")}`;
     if (typeof AndroidFunction.buyProduct !== "function")
       AndroidFunction.buyProduct = noop;
   }
-  function setup8(helper, context) {
-    setup2(helper, context);
+  function setup9(helper, context) {
+    setup(helper, context);
     ensurePurchaseStubs(helper);
     const purchaseKeys = helper.uralpro.config.purchaseFunctionList.map((item) => item.key);
     const androidProducts = [];
@@ -5283,7 +5967,7 @@ ${event.error.stack.split("\n").join("\n")}`;
   }
   var PLAYDECK_SAVE_KEY = "uralpro_game_data";
   var PLAYDECK_CHUNK_SIZE = 9e3;
-  function createAdapter9(helper) {
+  function createAdapter10(helper) {
     const storage = typeof localStorage !== "undefined" ? {
       getItem: (key) => {
         try {
@@ -5474,13 +6158,13 @@ ${event.error.stack.split("\n").join("\n")}`;
       }
     };
   }
-  function setup9(helper, context) {
+  function setup10(helper, context) {
     return __async(this, null, function* () {
       try {
         const isInIframe = window.self !== window.top;
         if (!isInIframe) {
           helper.uralpro.warn("PlayDeck: \u043D\u0435 \u043E\u0431\u043D\u0430\u0440\u0443\u0436\u0435\u043D iframe, \u043F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435 \u043D\u0430 \u043B\u043E\u043A\u0430\u043B\u044C\u043D\u043E\u0435 \u043E\u043A\u0440\u0443\u0436\u0435\u043D\u0438\u0435.");
-          setup2(helper, context);
+          setup(helper, context);
           return;
         }
         helper.uralpro.log("\u0418\u043D\u0438\u0446\u0438\u0430\u043B\u0438\u0437\u0430\u0446\u0438\u044F PlayDeck SDK...");
@@ -5929,7 +6613,7 @@ ${event.error.stack.split("\n").join("\n")}`;
         helper.uralpro.log("PlayDeck SDK \u0438\u043D\u0438\u0446\u0438\u0430\u043B\u0438\u0437\u0438\u0440\u043E\u0432\u0430\u043D");
       } catch (error) {
         helper.uralpro.error("\u041E\u0448\u0438\u0431\u043A\u0430 \u0438\u043D\u0438\u0446\u0438\u0430\u043B\u0438\u0437\u0430\u0446\u0438\u0438 PlayDeck SDK:", error);
-        setup2(helper, context);
+        setup(helper, context);
       }
     });
   }
@@ -5940,25 +6624,27 @@ ${event.error.stack.split("\n").join("\n")}`;
   function getPlatformAdapter(platform, helper) {
     switch (platform) {
       case PLATFORM_YANDEX:
-        return createAdapter(helper);
-      case PLATFORM_VK:
         return createAdapter3(helper);
-      case PLATFORM_OK:
+      case PLATFORM_VK:
         return createAdapter4(helper);
-      case PLATFORM_POKI:
+      case PLATFORM_OK:
         return createAdapter5(helper);
-      case PLATFORM_CRAZYGAMES:
+      case PLATFORM_POKI:
         return createAdapter6(helper);
-      case PLATFORM_GAMEPIX:
+      case PLATFORM_CRAZYGAMES:
         return createAdapter7(helper);
-      case PLATFORM_ANDROID:
+      case PLATFORM_GAMEPIX:
         return createAdapter8(helper);
-      case PLATFORM_PLAYDECK:
+      case PLATFORM_ANDROID:
         return createAdapter9(helper);
+      case PLATFORM_PLAYDECK:
+        return createAdapter10(helper);
+      case PLATFORM_YOUTUBE:
+        return createAdapter2(helper);
       case PLATFORM_FILE:
       case PLATFORM_UNKNOWN:
       default:
-        return createAdapter2(helper);
+        return createAdapter(helper);
     }
   }
   function createAdApi(helper) {
@@ -6099,46 +6785,49 @@ ${event.error.stack.split("\n").join("\n")}`;
     const self = helper;
     switch (platform) {
       case PLATFORM_FILE:
-        setup2(helper, context);
+        setup(helper, context);
         break;
       case PLATFORM_YANDEX:
-        self.scriptManager.loadJS("/sdk.js", () => setup(helper, context));
+        self.scriptManager.loadJS("/sdk.js", () => setup3(helper, context));
         break;
       case PLATFORM_POKI:
         if (typeof PokiSDK !== "undefined") {
-          setup5(helper, context);
+          setup6(helper, context);
         } else {
-          self.scriptManager.loadJS("https://game-cdn.poki.com/scripts/v2/poki-sdk.js", () => setup5(helper, context));
+          self.scriptManager.loadJS("https://game-cdn.poki.com/scripts/v2/poki-sdk.js", () => setup6(helper, context));
         }
         break;
       case PLATFORM_VK:
-        setup3(helper, context);
+        setup4(helper, context);
         break;
       case PLATFORM_OK:
-        setup4(helper, context);
+        setup5(helper, context);
         break;
       case PLATFORM_CRAZYGAMES:
         if ((_a = window.CrazyGames) == null ? void 0 : _a.SDK) {
-          setup6(helper, context);
+          setup7(helper, context);
         } else {
-          self.scriptManager.loadJS("https://sdk.crazygames.com/crazygames-sdk-v3.js", () => setup6(helper, context));
+          self.scriptManager.loadJS("https://sdk.crazygames.com/crazygames-sdk-v3.js", () => setup7(helper, context));
         }
         break;
       case PLATFORM_GAMEPIX:
         if (typeof window.GamePix !== "undefined") {
-          setup7(helper, context);
+          setup8(helper, context);
         } else {
-          self.scriptManager.loadJS("https://integration.gamepix.com/sdk/v3/gamepix.sdk.js", () => setup7(helper, context));
+          self.scriptManager.loadJS("https://integration.gamepix.com/sdk/v3/gamepix.sdk.js", () => setup8(helper, context));
         }
         break;
       case PLATFORM_ANDROID:
-        setup8(helper, context);
-        break;
-      case PLATFORM_PLAYDECK:
         setup9(helper, context);
         break;
-      default:
+      case PLATFORM_PLAYDECK:
+        setup10(helper, context);
+        break;
+      case PLATFORM_YOUTUBE:
         setup2(helper, context);
+        break;
+      default:
+        setup(helper, context);
         break;
     }
   }
@@ -6146,6 +6835,14 @@ ${event.error.stack.split("\n").join("\n")}`;
   // src/index.js
   var UralProHelperJS = class {
     constructor(config = {}) {
+      /** Коалесцинг saveDataUrgently: таймеры и общий Promise для await всех вызовов в серии */
+      __publicField(this, "_saveUrgentDebounceTimer", null);
+      __publicField(this, "_saveUrgentMaxWaitTimer", null);
+      __publicField(this, "_saveUrgentSharedPromise", null);
+      __publicField(this, "_saveUrgentSharedResolve", null);
+      __publicField(this, "_saveUrgentBurstStart", 0);
+      __publicField(this, "_saveUrgentMicrotaskQueued", false);
+      __publicField(this, "_saveUrgentRequestedFlush", false);
       // ---------- Сохранение данных ----------
       __publicField(this, "saveData", () => {
         if (this.uralpro.get("setup_saveData") == 1) {
@@ -6160,13 +6857,81 @@ ${event.error.stack.split("\n").join("\n")}`;
               this.saveDataUrgently();
             }
             this.uralpro.timeoutId_saveData = setTimeout(() => {
+              this.uralpro.timeoutId_saveData = null;
               this.saveDataUrgently();
             }, 3100);
           }
         }
       });
-      __publicField(this, "saveDataUrgently", () => __async(this, null, function* () {
-        yield this._storage.saveDataUrgently();
+      /**
+       * Сохранение «срочно». При saveUrgentCoalesce множественные вызовы сливаются в один проход через storage
+       * (debounce + maxWait), чтобы не порождать сотни обращений к SDK/сети.
+       */
+      __publicField(this, "saveDataUrgently", (..._0) => __async(this, [..._0], function* (options = {}) {
+        const normalizedOptions = options && typeof options === "object" ? options : {};
+        const forceImmediate = normalizedOptions.immediate === true;
+        const requestFlush = normalizedOptions.flush === true;
+        if (!this.uralpro.config.saveUrgentCoalesce || forceImmediate) {
+          if (forceImmediate && this._saveUrgentSharedPromise) {
+            this._saveUrgentRequestedFlush = this._saveUrgentRequestedFlush || requestFlush;
+            yield this._flushUrgentDebounced();
+          } else {
+            yield this._storage.saveDataUrgently({ flush: requestFlush });
+          }
+          return;
+        }
+        const debounceRaw = this.uralpro.config.saveUrgentDebounceMs;
+        const maxWaitRaw = this.uralpro.config.saveUrgentMaxWaitMs;
+        const deb = Number.isFinite(Number(debounceRaw)) && Number(debounceRaw) >= 0 ? Number(debounceRaw) : 160;
+        const maxW = Number.isFinite(Number(maxWaitRaw)) && Number(maxWaitRaw) >= 0 ? Number(maxWaitRaw) : 4e3;
+        if (!this._saveUrgentSharedPromise) {
+          this._saveUrgentSharedPromise = new Promise((resolve) => {
+            this._saveUrgentSharedResolve = resolve;
+          });
+          this._saveUrgentBurstStart = Date.now();
+        }
+        this._saveUrgentRequestedFlush = this._saveUrgentRequestedFlush || requestFlush;
+        const scheduleDebounce = () => {
+          if (deb <= 0) {
+            if (this._saveUrgentMicrotaskQueued)
+              return;
+            this._saveUrgentMicrotaskQueued = true;
+            queueMicrotask(() => {
+              this._saveUrgentMicrotaskQueued = false;
+              this._flushUrgentDebounced();
+            });
+          } else {
+            clearTimeout(this._saveUrgentDebounceTimer);
+            this._saveUrgentDebounceTimer = setTimeout(() => this._flushUrgentDebounced(), deb);
+          }
+        };
+        scheduleDebounce();
+        if (!this._saveUrgentMaxWaitTimer && maxW > 0) {
+          const elapsed = Date.now() - this._saveUrgentBurstStart;
+          const remaining = Math.max(0, maxW - elapsed);
+          this._saveUrgentMaxWaitTimer = setTimeout(() => this._flushUrgentDebounced(), remaining);
+        }
+        return this._saveUrgentSharedPromise;
+      }));
+      __publicField(this, "_flushUrgentDebounced", () => __async(this, null, function* () {
+        clearTimeout(this._saveUrgentDebounceTimer);
+        this._saveUrgentDebounceTimer = null;
+        clearTimeout(this._saveUrgentMaxWaitTimer);
+        this._saveUrgentMaxWaitTimer = null;
+        const resolveAll = this._saveUrgentSharedResolve;
+        if (!this._saveUrgentSharedPromise)
+          return;
+        this._saveUrgentSharedPromise = null;
+        this._saveUrgentSharedResolve = null;
+        this._saveUrgentBurstStart = 0;
+        const requestFlush = this._saveUrgentRequestedFlush;
+        this._saveUrgentRequestedFlush = false;
+        try {
+          yield this._storage.saveDataUrgently({ flush: requestFlush });
+        } finally {
+          if (typeof resolveAll === "function")
+            resolveAll();
+        }
       }));
       // Менеджер управления сохранениями
       __publicField(this, "saveManager", createSaveManager(this));
@@ -6240,7 +7005,10 @@ ${event.error.stack.split("\n").join("\n")}`;
         },
         set: (key, value) => {
           if (utils.isCalledFromConsole()) {
-            this.uralpro.error("\u0418\u0437\u043C\u0435\u043D\u0435\u043D\u0438\u0435 mapDataSDK \u0438\u0437 \u043A\u043E\u043D\u0441\u043E\u043B\u0438 \u0437\u0430\u043F\u0440\u0435\u0449\u0435\u043D\u043E.");
+            this.uralpro.error(utils.formatConsoleBlockedError("uralpro.set (\u0432\u043D\u0443\u0442\u0440\u0435\u043D\u043D\u0435\u0435 \u0445\u0440\u0430\u043D\u0438\u043B\u0438\u0449\u0435 mapDataSDK)", {
+              \u043A\u043B\u044E\u0447: String(key),
+              "\u0437\u043D\u0430\u0447\u0435\u043D\u0438\u0435 (\u0444\u0440\u0430\u0433\u043C\u0435\u043D\u0442)": utils.truncateForLog(value, 150)
+            }));
             return;
           }
           this.uralpro.mapDataSDK.set(key, value);
@@ -6291,6 +7059,8 @@ ${event.error.stack.split("\n").join("\n")}`;
           self.uralpro.set("isSdkReadyData", false);
           self.uralpro.set("isLoaded", false);
           self.uralpro.set("isGameReady", false);
+          self.uralpro.set("_yandexCloudDataReady", false);
+          self.uralpro.set("_saveIntervalStarted", false);
           self.uralpro.set("mapDataApp", /* @__PURE__ */ new Map());
           self.uralpro.set("saveDataOld1", /* @__PURE__ */ new Map());
           self.uralpro.set("saveDataOld2", /* @__PURE__ */ new Map());
@@ -6354,6 +7124,7 @@ ${event.error.stack.split("\n").join("\n")}`;
                 case PLATFORM_VK:
                 case PLATFORM_OK:
                 case PLATFORM_CRAZYGAMES:
+                case PLATFORM_YOUTUBE:
                 case PLATFORM_GAMEPIX: {
                   const mapApp2 = self.uralpro.get("mapDataApp");
                   if (mapApp2 && mapApp2.has(idname)) {
@@ -6386,7 +7157,7 @@ ${event.error.stack.split("\n").join("\n")}`;
             const knownKeys = new Set(self.uralpro.save_idArray.map(([k]) => k));
             const prefixLen = self.uralpro.save_id000.length;
             const loadSource = self.uralpro.get("getPlayer") === PLATFORM_YANDEX ? PLATFORM_YANDEX : self.platform;
-            if (loadSource === PLATFORM_YANDEX || loadSource === PLATFORM_VK || loadSource === PLATFORM_OK || loadSource === PLATFORM_PLAYDECK || loadSource === PLATFORM_CRAZYGAMES || loadSource === PLATFORM_GAMEPIX) {
+            if (loadSource === PLATFORM_YANDEX || loadSource === PLATFORM_VK || loadSource === PLATFORM_OK || loadSource === PLATFORM_PLAYDECK || loadSource === PLATFORM_CRAZYGAMES || loadSource === PLATFORM_GAMEPIX || loadSource === PLATFORM_YOUTUBE) {
               const mapApp2 = self.uralpro.get("mapDataApp");
               if (mapApp2) {
                 mapApp2.forEach((rawVal, idname) => {
@@ -6444,6 +7215,22 @@ ${event.error.stack.split("\n").join("\n")}`;
                 }
                 self.uralpro.set("getPlayer", PLATFORM_YANDEX);
                 self.uralpro.set("_player", _player);
+                try {
+                  const rawName = typeof _player.getName === "function" ? _player.getName() : null;
+                  const rawId = typeof _player.getUniqueID === "function" ? _player.getUniqueID() : typeof _player.getUniqueId === "function" ? _player.getUniqueId() : null;
+                  const prevName = self.uralpro.get("playerName") || self.uralpro.get("name");
+                  const normalizedName = rawName && String(rawName).trim() || prevName || "Guest";
+                  self.uralpro.set("playerName", normalizedName);
+                  self.uralpro.set("name", normalizedName);
+                  const prevId = self.uralpro.get("playerID") || self.uralpro.get("playerId");
+                  const normalizedId = rawId && String(rawId).trim() || prevId || null;
+                  if (normalizedId) {
+                    self.uralpro.set("playerID", normalizedId);
+                    self.uralpro.set("playerId", normalizedId);
+                  }
+                } catch (e) {
+                  self.uralpro.warn("\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u044C \u0438\u043C\u044F/ID \u0438\u0433\u0440\u043E\u043A\u0430 \u0438\u0437 Yandex SDK:", e);
+                }
                 let attempts = 3;
                 let dataLoaded = false;
                 while (attempts > 0 && !dataLoaded) {
@@ -6469,14 +7256,26 @@ ${event.error.stack.split("\n").join("\n")}`;
                 if (!dataLoaded) {
                   self.uralpro.error("\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044C \u0434\u0430\u043D\u043D\u044B\u0435 \u0438\u0433\u0440\u043E\u043A\u0430. \u041F\u0440\u043E\u0432\u0435\u0440\u044C\u0442\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435 \u043A \u0438\u043D\u0442\u0435\u0440\u043D\u0435\u0442\u0443.");
                   self.uralpro.set("isSdkReadyStop", "STOP");
+                  self.uralpro.set("_yandexCloudDataReady", false);
+                } else {
+                  self.uralpro.set("_yandexCloudDataReady", true);
                 }
                 loadStartData.bind(self)();
                 self.uralpro.set("setup_saveData", 1);
-                self.saveData();
-                setInterval(self.saveData, 1e3 * 60);
+                if (dataLoaded) {
+                  self.saveData();
+                } else {
+                  self.uralpro.warn("Yandex: \u0441\u0442\u0430\u0440\u0442\u043E\u0432\u044B\u0439 cloud save \u043F\u0440\u043E\u043F\u0443\u0449\u0435\u043D, \u0442.\u043A. \u0434\u0430\u043D\u043D\u044B\u0435 \u0438\u0433\u0440\u043E\u043A\u0430 \u043D\u0435 \u0431\u044B\u043B\u0438 \u0437\u0430\u0433\u0440\u0443\u0436\u0435\u043D\u044B.");
+                }
+                if (!self.uralpro.get("_saveIntervalStarted")) {
+                  self.uralpro.set("_saveIntervalStarted", true);
+                  setInterval(self.saveData, 1e3 * 60);
+                }
                 if (dataLoaded) {
                   self.uralpro.set("isSdkReadyData", true);
                   self.uralpro.set("isSdkReadyStop", "START");
+                } else {
+                  setTimeout(() => getPlayerData.bind(self)(), 5e3);
                 }
               } catch (error) {
                 self.uralpro.set("isSdkReadyStop", "STOP");
@@ -6543,7 +7342,7 @@ ${event.error.stack.split("\n").join("\n")}`;
     }
     // ---------- Версия, платформа, язык ----------
     get version() {
-      return "0.246";
+      return "0.274";
     }
     get language() {
       return this.uralpro.get("lang");
@@ -6826,6 +7625,75 @@ ${event.error.stack.split("\n").join("\n")}`;
         }
       });
     }
+    /** YouTube Playables: полная пауза (gameStop, колбэки игры, без Page Visibility API). */
+    _youtubeDoPause() {
+      if (this.uralpro.get("isPageHidden"))
+        return;
+      if (this.uralpro.config.audioMuteDocumentVisibility) {
+        try {
+          this.audio.muteAll();
+        } catch (e) {
+        }
+      }
+      this.uralpro.set("isPageHidden", true);
+      try {
+        this.gameStop();
+      } catch (e) {
+      }
+      const onHidden = this.uralpro.get("_youtubeVisibilityOnHidden");
+      if (typeof onHidden === "function") {
+        try {
+          onHidden();
+        } catch (e) {
+          this.uralpro.error("YouTube Playables: onHidden callback error:", e);
+        }
+      }
+    }
+    /** YouTube Playables: возобновление после onResume. */
+    _youtubeDoResume() {
+      var _a, _b;
+      if (!this.uralpro.get("isPageHidden"))
+        return;
+      if (((_a = this.audio.context) == null ? void 0 : _a.state) === "suspended") {
+        try {
+          this.audio.context.resume();
+        } catch (e) {
+        }
+      }
+      const restoreAudio = () => {
+        if (!this.uralpro.get("_youtubeSystemAudioEnabled", true))
+          return;
+        if (this.uralpro.config.audioMuteDocumentVisibility) {
+          try {
+            this.audio.unmuteAll();
+          } catch (e) {
+          }
+        }
+      };
+      const sdk = this.uralpro.get("sdk");
+      if (((_b = sdk == null ? void 0 : sdk.system) == null ? void 0 : _b.isAudioEnabled) && typeof sdk.system.isAudioEnabled === "function") {
+        Promise.resolve(sdk.system.isAudioEnabled()).then((enabled) => {
+          this.uralpro.set("_youtubeSystemAudioEnabled", !!enabled);
+          if (enabled)
+            restoreAudio();
+        }).catch(restoreAudio);
+      } else {
+        restoreAudio();
+      }
+      this.uralpro.set("isPageHidden", false);
+      try {
+        this.gameStart();
+      } catch (e) {
+      }
+      const onVisible = this.uralpro.get("_youtubeVisibilityOnVisible");
+      if (typeof onVisible === "function") {
+        try {
+          onVisible();
+        } catch (e) {
+          this.uralpro.error("YouTube Playables: onVisible callback error:", e);
+        }
+      }
+    }
     // ---------- Видимость страницы и пауза ----------
     documentVisibility({
       onHidden = () => {
@@ -6837,6 +7705,7 @@ ${event.error.stack.split("\n").join("\n")}`;
         const adapter = this._platformAdapter;
         const isGamePix = this.platform === PLATFORM_GAMEPIX;
         const isPlayDeck = this.platform === PLATFORM_PLAYDECK;
+        const isYouTube = this.platform === PLATFORM_YOUTUBE;
         const ensureGamePixPause = () => {
           var _a, _b;
           if (!isGamePix)
@@ -6893,8 +7762,19 @@ ${event.error.stack.split("\n").join("\n")}`;
             onVisible();
           ensureGamePixResume();
         };
-        this._visibilityDoPause = doPause;
-        this._visibilityDoResume = doResume;
+        if (isYouTube) {
+          this.uralpro.set("_youtubeVisibilityOnHidden", onHidden);
+          this.uralpro.set("_youtubeVisibilityOnVisible", onVisible);
+          this._visibilityDoPause = () => this._youtubeDoPause();
+          this._visibilityDoResume = () => this._youtubeDoResume();
+          this.uralpro.log(
+            "YouTube Playables: \u043F\u0430\u0443\u0437\u0430/\u0440\u0435\u0437\u044E\u043C \u0447\u0435\u0440\u0435\u0437 ytgame.system (gameStop/gameStart + \u043A\u043E\u043B\u0431\u044D\u043A\u0438).",
+            this.uralpro.logStyle("blue", "yellow")
+          );
+        } else {
+          this._visibilityDoPause = doPause;
+          this._visibilityDoResume = doResume;
+        }
         if (this.platform === PLATFORM_YANDEX) {
           const sdk = this.uralpro.get("sdk");
           if (!(sdk == null ? void 0 : sdk.on) || !(sdk == null ? void 0 : sdk.off)) {
@@ -6904,6 +7784,7 @@ ${event.error.stack.split("\n").join("\n")}`;
           sdk.on("game_api_pause", doPause);
           sdk.on("game_api_resume", doResume);
           this.uralpro.log("\u041F\u043E\u0434\u043F\u0438\u0441\u043A\u0430 \u043D\u0430 \u0441\u043E\u0431\u044B\u0442\u0438\u044F game_api_pause \u0438 game_api_resume \u0432\u044B\u043F\u043E\u043B\u043D\u0435\u043D\u0430.", this.uralpro.logStyle("blue", "yellow"));
+        } else if (isYouTube) {
         } else {
           document.addEventListener("visibilitychange", () => {
             if (document.hidden)
@@ -7008,6 +7889,38 @@ ${event.error.stack.split("\n").join("\n")}`;
         }
       });
     }
+    /**
+     * YouTube Playables: сигнал о первом кадре (splash/loading). Вызывайте при начале отрисовки экрана загрузки.
+     * Если не вызвать вручную, helper попробует отправить сигнал автоматически после init (два rAF).
+     */
+    notifyFirstFrameReady() {
+      var _a;
+      if (this.platform !== PLATFORM_YOUTUBE)
+        return;
+      if (this.uralpro.get("youtube_first_frame_ready_called"))
+        return;
+      const sdk = this.uralpro.get("sdk");
+      if (typeof ((_a = sdk == null ? void 0 : sdk.game) == null ? void 0 : _a.firstFrameReady) !== "function")
+        return;
+      try {
+        sdk.game.firstFrameReady();
+        this.uralpro.set("youtube_first_frame_ready_called", true);
+        this.uralpro.log("YouTube Playables: firstFrameReady()", this.uralpro.logStyle("green", "black"));
+      } catch (e) {
+        this.uralpro.warn("\u041E\u0448\u0438\u0431\u043A\u0430 \u0432\u044B\u0437\u043E\u0432\u0430 ytgame.game.firstFrameReady():", e);
+      }
+    }
+    /** YouTube Playables: отправить лучший счёт в YouTube (ytgame.engagement.sendScore). */
+    sendPlatformScore(score) {
+      var _a, _b;
+      if (this.platform !== PLATFORM_YOUTUBE)
+        return;
+      try {
+        (_b = (_a = this._platformAdapter) == null ? void 0 : _a.sendScore) == null ? void 0 : _b.call(_a, score);
+      } catch (e) {
+        this.uralpro.warn("sendPlatformScore error:", e);
+      }
+    }
     setGameReady() {
       this.uralpro.set("isGameReady", true);
       this.uralpro.log("\u0420\u0435\u0441\u0443\u0440\u0441\u044B \u0438\u0433\u0440\u044B \u0437\u0430\u0433\u0440\u0443\u0436\u0435\u043D\u044B.", this.uralpro.logStyle("green", "black"));
@@ -7031,17 +7944,33 @@ ${event.error.stack.split("\n").join("\n")}`;
         setTimeout(() => this.ready(), 1e3);
         return;
       }
+      if (this.platform == PLATFORM_YOUTUBE && (!this.uralpro.get("isSdkReady") || !this.uralpro.get("isGameReady"))) {
+        this.uralpro.log("SDK \u0438\u043B\u0438 \u0438\u0433\u0440\u0430 \u0435\u0449\u0451 \u043D\u0435 \u0433\u043E\u0442\u043E\u0432\u044B. \u041E\u0436\u0438\u0434\u0430\u043D\u0438\u0435...");
+        setTimeout(() => this.ready(), 1e3);
+        return;
+      }
       this.uralpro.log("SDK \u0438 \u0438\u0433\u0440\u0430 \u0433\u043E\u0442\u043E\u0432\u044B!", this.uralpro.logStyle("green", "black"));
       this._notifyPlatformLoaded();
     }
     /** Уведомить платформу о завершении загрузки игры (LoadingAPI.ready / gameLoadingFinished / loaded). */
     _notifyPlatformLoaded() {
-      var _a, _b;
+      var _a, _b, _c;
       const platform = this.platform;
       const sdk = this.uralpro.get("sdk");
       switch (platform) {
         case PLATFORM_YANDEX:
           (_b = (_a = sdk == null ? void 0 : sdk.features) == null ? void 0 : _a.LoadingAPI) == null ? void 0 : _b.ready();
+          break;
+        case PLATFORM_YOUTUBE:
+          if (!this.uralpro.get("youtube_game_ready_called") && typeof ((_c = sdk == null ? void 0 : sdk.game) == null ? void 0 : _c.gameReady) === "function") {
+            try {
+              sdk.game.gameReady();
+              this.uralpro.set("youtube_game_ready_called", true);
+              this.uralpro.log("YouTube Playables: gameReady()", this.uralpro.logStyle("green", "black"));
+            } catch (e) {
+              this.uralpro.warn("\u041E\u0448\u0438\u0431\u043A\u0430 \u0432\u044B\u0437\u043E\u0432\u0430 ytgame.game.gameReady():", e);
+            }
+          }
           break;
         case PLATFORM_POKI:
           if (typeof (sdk == null ? void 0 : sdk.gameLoadingFinished) === "function")
@@ -7063,6 +7992,12 @@ ${event.error.stack.split("\n").join("\n")}`;
     }
     // ---------- Проверка сети ----------
     checkInternetConnection() {
+      if (this.platform === PLATFORM_YOUTUBE && !this.uralpro.get("_youtubeInternetCheckWarned")) {
+        this.uralpro.set("_youtubeInternetCheckWarned", true);
+        this.uralpro.warn(
+          "YouTube Playables: checkInternetConnection() \u0432\u044B\u043F\u043E\u043B\u043D\u044F\u0435\u0442 \u0432\u043D\u0435\u0448\u043D\u0438\u0439 fetch. \u0414\u043B\u044F onSdkReady \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u0439\u0442\u0435 skipInternetCheckOnYoutube: true (\u043F\u043E \u0443\u043C\u043E\u043B\u0447\u0430\u043D\u0438\u044E \u0432\u043A\u043B\u044E\u0447\u0435\u043D\u043E)."
+        );
+      }
       function formatDate(date) {
         let day = String(date.getDate()).padStart(2, "0");
         let month = String(date.getMonth() + 1).padStart(2, "0");
@@ -7121,13 +8056,15 @@ ${event.error.stack.split("\n").join("\n")}`;
     }
     // ---------- Колбэк готовности SDK ----------
     onSdkReady(callback) {
+      var _a;
       if (!this.uralpro.has("onSdkReady_END")) {
         if (this.uralpro.get("isSdkReadyStop") == "START") {
           if (!this.uralpro.has("platform")) {
             setTimeout(() => this.onSdkReady(callback), 300);
           } else {
             if (this.uralpro.get("isSdkReady") && this.uralpro.get("isSdkReadyData")) {
-              if (this.platform == PLATFORM_FILE || this.platform == PLATFORM_ANDROID) {
+              const skipYoutubeNetCheck = this.platform === PLATFORM_YOUTUBE && ((_a = this.uralpro.config) == null ? void 0 : _a.skipInternetCheckOnYoutube) !== false;
+              if (this.platform == PLATFORM_FILE || this.platform == PLATFORM_ANDROID || skipYoutubeNetCheck) {
                 callback();
                 this.uralpro.set("onSdkReady_END", "END");
               } else {
@@ -7163,7 +8100,9 @@ ${event.error.stack.split("\n").join("\n")}`;
     // ---------- save_idArray, сжатие, менеджер сохранений ----------
     defsetData(key) {
       if (utils.isCalledFromConsole()) {
-        this.uralpro.error("\u0418\u0437\u043C\u0435\u043D\u0435\u043D\u0438\u0435 mapDataSDK \u0438\u0437 \u043A\u043E\u043D\u0441\u043E\u043B\u0438 \u0437\u0430\u043F\u0440\u0435\u0449\u0435\u043D\u043E.");
+        this.uralpro.error(utils.formatConsoleBlockedError("defsetData (\u0443\u0441\u0442\u0430\u043D\u043E\u0432\u043A\u0430 \u0437\u043D\u0430\u0447\u0435\u043D\u0438\u044F \u043F\u043E \u0443\u043C\u043E\u043B\u0447\u0430\u043D\u0438\u044E \u0438\u0437 save_idArray)", {
+          \u043A\u043B\u044E\u0447: String(key)
+        }));
         return;
       }
       if (this.uralpro.save_idArray) {
@@ -7327,4 +8266,4 @@ ${event.error.stack.split("\n").join("\n")}`;
   }
   var src_default = UralProHelperJS;
 })();
-/*! Ural Pro Helper JS v0.246 */
+/*! Ural Pro Helper JS v0.274 */
